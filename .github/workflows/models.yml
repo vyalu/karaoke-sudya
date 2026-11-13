@@ -38,7 +38,7 @@ jobs:
           git clone https://github.com/sevagh/demucs.cpp dcpp
           git -C dcpp checkout 4edae497a114de1ccb17ac9b4a2b8fc0144714d7
           python3 -m venv venv
-          venv/bin/pip install -q torch --index-url https://download.pytorch.org/whl/cpu
+          venv/bin/pip install -q torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cpu
           venv/bin/pip install -q demucs==4.0.1 numpy
           venv/bin/python dcpp/scripts/convert-pth-to-ggml.py out
           ls -l out
