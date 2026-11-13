@@ -1,0 +1,164 @@
+# Публикует релиз, когда в main меняется номер версии в Cargo.toml.
+# Собирает программу, минимальный ffmpeg, whisper-cli и kj-demucs под Windows, упаковывает два архива
+# (программа и дополнение «Нейросети»: отделение голосов и распознавание речи),
+# описание берёт из раздела версии в CHANGELOG.md. Если релиз уже есть — ничего не делает.
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Cargo.toml
+      - .github/workflows/release.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Номер версии
+        id: v
+        run: |
+          ver="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          echo "ver=$ver" >> "$GITHUB_OUTPUT"
+          if gh release view "v$ver" >/dev/null 2>&1; then
+            echo "Релиз v$ver уже опубликован — пропускаю"
+            echo "skip=1" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Инструменты
+        if: steps.v.outputs.skip != '1'
+        run: sudo apt-get update && sudo apt-get install -y mingw-w64 nasm zip cmake libeigen3-dev
+
+      - name: Rust
+        if: steps.v.outputs.skip != '1'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Кэш ffmpeg
+        if: steps.v.outputs.skip != '1'
+        id: ffcache
+        uses: actions/cache@v4
+        with:
+          path: ffbuild/ffmpeg.exe
+          key: ffmpeg-n7.1-${{ hashFiles('tools/ffmpeg-build.sh') }}
+
+      - name: ffmpeg
+        if: steps.v.outputs.skip != '1' && steps.ffcache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 -b n7.1 https://github.com/FFmpeg/FFmpeg.git ffsrc
+          tools/ffmpeg-build.sh ffsrc win ffbuild
+
+      - name: Кэш whisper-cli
+        if: steps.v.outputs.skip != '1'
+        id: wcache
+        uses: actions/cache@v4
+        with:
+          path: wbuild/whisper-cli.exe
+          key: whisper-v1.7.4-${{ hashFiles('tools/whisper-build.sh') }}
+
+      - name: whisper-cli
+        if: steps.v.outputs.skip != '1' && steps.wcache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 -b v1.7.4 https://github.com/ggml-org/whisper.cpp.git wsrc
+          tools/whisper-build.sh wsrc wbuild
+
+      - name: Кэш kj-demucs
+        if: steps.v.outputs.skip != '1'
+        id: dcache
+        uses: actions/cache@v4
+        with:
+          path: dbuild/kj-demucs.exe
+          key: demucs-4edae49-${{ hashFiles('tools/demucs-build.sh', 'tools/demucs/kj-demucs.cpp') }}
+
+      - name: kj-demucs
+        if: steps.v.outputs.skip != '1' && steps.dcache.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/sevagh/demucs.cpp dsrc
+          git -C dsrc checkout 4edae497a114de1ccb17ac9b4a2b8fc0144714d7
+          tools/demucs-build.sh dsrc dbuild
+
+      - name: Модель Whisper
+        if: steps.v.outputs.skip != '1'
+        run: |
+          curl -fsSL -o ggml-base.bin https://github.com/${{ github.repository }}/releases/download/models/ggml-base.bin
+          echo "465707469ff3a37a2b9b8d8f89f2f99de7299dac  ggml-base.bin" | sha1sum -c -
+          curl -fsSL -o ggml-htdemucs-4s-f16.bin https://github.com/${{ github.repository }}/releases/download/models/ggml-htdemucs-4s-f16.bin
+          echo "9a4e952c9074d92f484a254fa0178c4283a4e97e  ggml-htdemucs-4s-f16.bin" | sha1sum -c -
+
+      - name: Программа
+        if: steps.v.outputs.skip != '1'
+        run: cargo build --release --target x86_64-pc-windows-gnu
+
+      - name: Архив
+        if: steps.v.outputs.skip != '1'
+        run: |
+          ver="${{ steps.v.outputs.ver }}"
+          d=pkg/Karaoke
+          mkdir -p "$d"
+          cp target/x86_64-pc-windows-gnu/release/karaoke.exe "$d/Karaoke-sudya.exe"
+          cp "$(find target/x86_64-pc-windows-gnu/release/build -path '*webview2-com-sys*/out/x64/WebView2Loader.dll' | head -1)" "$d/"
+          x86_64-w64-mingw32-strip -o "$d/ffmpeg.exe" ffbuild/ffmpeg.exe
+          cp LICENSE "$d/LICENSE.txt"
+          cp third_party/speexdsp/COPYING "$d/LICENSE-SpeexDSP.txt"
+          curl -sSL -o "$d/LICENSE-ffmpeg.txt" https://raw.githubusercontent.com/FFmpeg/FFmpeg/n7.1/COPYING.LGPLv2.1
+          {
+            echo "ffmpeg.exe — FFmpeg 7.1 (https://ffmpeg.org), LGPL 2.1 or later."
+            echo "Source: https://github.com/FFmpeg/FFmpeg/tree/n7.1"
+            echo "Build options: tools/ffmpeg-build.sh in https://github.com/${{ github.repository }}"
+          } > "$d/ffmpeg-build.txt"
+          (cd pkg && zip -qr "../Karaoke-sudya-v$ver.zip" Karaoke)
+          # дополнение «Нейросети»: только нейросети, распаковывается в папку с программой
+          a=addon/Karaoke
+          mkdir -p "$a"
+          cp wbuild/whisper-cli.exe "$a/"
+          cp dbuild/kj-demucs.exe "$a/"
+          mkdir -p "$a/models" && mv ggml-base.bin ggml-htdemucs-4s-f16.bin "$a/models/"
+          curl -sSL -o "$a/LICENSE-demucs.txt" https://raw.githubusercontent.com/facebookresearch/demucs/main/LICENSE
+          curl -sSL -o "$a/LICENSE-whisper.txt" https://raw.githubusercontent.com/ggml-org/whisper.cpp/v1.7.4/LICENSE
+          {
+            echo "whisper-cli.exe — whisper.cpp v1.7.4 (https://github.com/ggml-org/whisper.cpp), MIT."
+            echo "models/ggml-base.bin — OpenAI Whisper base (MIT), converted by whisper.cpp."
+            echo "kj-demucs.exe — tools/demucs/kj-demucs.cpp + demucs.cpp (https://github.com/sevagh/demucs.cpp, MIT), commit 4edae49."
+            echo "models/ggml-htdemucs-4s-f16.bin — Demucs htdemucs (https://github.com/facebookresearch/demucs, MIT), converted by demucs.cpp."
+            echo "Build options: tools/whisper-build.sh, tools/demucs-build.sh in https://github.com/${{ github.repository }}"
+          } > "$a/neural-build.txt"
+          (cd addon && zip -qr "../Karaoke-sudya-AI-addon-v$ver.zip" Karaoke)
+
+      - name: Описание из CHANGELOG.md
+        if: steps.v.outputs.skip != '1'
+        run: |
+          ver="${{ steps.v.outputs.ver }}"
+          awk -v v="$ver" '
+            index($0, "## [" v "]") == 1 { f = 1; next }
+            /^## \[/ { if (f) exit }
+            /^\[[0-9]+\.[0-9]+\.[0-9]+\]: / { next }
+            f
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "::error::В CHANGELOG.md нет раздела для версии $ver"
+            exit 1
+          fi
+          {
+            echo
+            echo "---"
+            echo "**Что скачать:**"
+            echo "- \`Karaoke-sudya-v$ver.zip\` — сама программа (~9 МБ)."
+            echo "- \`Karaoke-sudya-AI-addon-v$ver.zip\` — дополнение «Нейросети» (~210 МБ), по желанию: в «Озвучке» голоса из ролика убираются начисто, а реплики с текстом находятся сами, без интернета. Распакуйте его в ту же папку, что и программу. Обновлять дополнение с каждой версией не обязательно."
+            echo
+            echo "**Установка:** распакуйте архив в любую папку и запустите \`Karaoke-sudya.exe\`. Для обновления распакуйте поверх — записи и настройки останутся."
+          } >> notes.md
+
+      - name: Релиз
+        if: steps.v.outputs.skip != '1'
+        run: gh release create "v${{ steps.v.outputs.ver }}" "Karaoke-sudya-v${{ steps.v.outputs.ver }}.zip" "Karaoke-sudya-AI-addon-v${{ steps.v.outputs.ver }}.zip" --title "v${{ steps.v.outputs.ver }}" --notes-file notes.md
+        env:
+          GH_TOKEN: ${{ github.token }}

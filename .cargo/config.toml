@@ -1,0 +1,5 @@
+# Build for Windows from Linux: rustup target add x86_64-pc-windows-gnu; apt install mingw-w64
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+ar = "x86_64-w64-mingw32-ar"
+rustflags = ["-C", "target-feature=+crt-static"]

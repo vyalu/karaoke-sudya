@@ -1,0 +1,11 @@
+/target
+# what the program creates next to itself — your recordings, clips and voices never go to git
+/Записи/
+/Озвучка/
+/Пародист/
+/Данные/
+# local builds
+/ffsrc/
+/ffbuild*/
+/pkg/
+*.zip
