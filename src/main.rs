@@ -9,7 +9,7 @@ mod apozh;
 mod dsp;
 mod dub;
 mod separate;
-mod speech;
+mod subtitles;
 mod game;
 mod mimic;
 mod sounds;

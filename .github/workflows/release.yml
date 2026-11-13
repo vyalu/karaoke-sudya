@@ -1,6 +1,6 @@
 # Публикует релиз, когда в main меняется номер версии в Cargo.toml.
-# Собирает программу, минимальный ffmpeg, whisper-cli и kj-demucs под Windows, упаковывает два архива
-# (программа и дополнение «Нейросети»: отделение голосов и распознавание речи),
+# Собирает программу, минимальный ffmpeg и kj-demucs под Windows, упаковывает два архива
+# (программа и дополнение «Нейросети» — отделение голосов от фона),
 # описание берёт из раздела версии в CHANGELOG.md. Если релиз уже есть — ничего не делает.
 name: Release
 
@@ -57,20 +57,6 @@ jobs:
           git clone --depth 1 -b n7.1 https://github.com/FFmpeg/FFmpeg.git ffsrc
           tools/ffmpeg-build.sh ffsrc win ffbuild
 
-      - name: Кэш whisper-cli
-        if: steps.v.outputs.skip != '1'
-        id: wcache
-        uses: actions/cache@v4
-        with:
-          path: wbuild/whisper-cli.exe
-          key: whisper-v1.7.4-${{ hashFiles('tools/whisper-build.sh') }}
-
-      - name: whisper-cli
-        if: steps.v.outputs.skip != '1' && steps.wcache.outputs.cache-hit != 'true'
-        run: |
-          git clone --depth 1 -b v1.7.4 https://github.com/ggml-org/whisper.cpp.git wsrc
-          tools/whisper-build.sh wsrc wbuild
-
       - name: Кэш kj-demucs
         if: steps.v.outputs.skip != '1'
         id: dcache
@@ -86,11 +72,9 @@ jobs:
           git -C dsrc checkout 4edae497a114de1ccb17ac9b4a2b8fc0144714d7
           tools/demucs-build.sh dsrc dbuild
 
-      - name: Модель Whisper
+      - name: Модель Demucs
         if: steps.v.outputs.skip != '1'
         run: |
-          curl -fsSL -o ggml-base.bin https://github.com/${{ github.repository }}/releases/download/models/ggml-base.bin
-          echo "465707469ff3a37a2b9b8d8f89f2f99de7299dac  ggml-base.bin" | sha1sum -c -
           curl -fsSL -o ggml-htdemucs-4s-f16.bin https://github.com/${{ github.repository }}/releases/download/models/ggml-htdemucs-4s-f16.bin
           echo "9a4e952c9074d92f484a254fa0178c4283a4e97e  ggml-htdemucs-4s-f16.bin" | sha1sum -c -
 
@@ -119,17 +103,13 @@ jobs:
           # дополнение «Нейросети»: только нейросети, распаковывается в папку с программой
           a=addon/Karaoke
           mkdir -p "$a"
-          cp wbuild/whisper-cli.exe "$a/"
           cp dbuild/kj-demucs.exe "$a/"
-          mkdir -p "$a/models" && mv ggml-base.bin ggml-htdemucs-4s-f16.bin "$a/models/"
+          mkdir -p "$a/models" && mv ggml-htdemucs-4s-f16.bin "$a/models/"
           curl -sSL -o "$a/LICENSE-demucs.txt" https://raw.githubusercontent.com/facebookresearch/demucs/main/LICENSE
-          curl -sSL -o "$a/LICENSE-whisper.txt" https://raw.githubusercontent.com/ggml-org/whisper.cpp/v1.7.4/LICENSE
           {
-            echo "whisper-cli.exe — whisper.cpp v1.7.4 (https://github.com/ggml-org/whisper.cpp), MIT."
-            echo "models/ggml-base.bin — OpenAI Whisper base (MIT), converted by whisper.cpp."
             echo "kj-demucs.exe — tools/demucs/kj-demucs.cpp + demucs.cpp (https://github.com/sevagh/demucs.cpp, MIT), commit 4edae49."
             echo "models/ggml-htdemucs-4s-f16.bin — Demucs htdemucs (https://github.com/facebookresearch/demucs, MIT), converted by demucs.cpp."
-            echo "Build options: tools/whisper-build.sh, tools/demucs-build.sh in https://github.com/${{ github.repository }}"
+            echo "Build options: tools/demucs-build.sh in https://github.com/${{ github.repository }}"
           } > "$a/neural-build.txt"
           (cd addon && zip -qr "../Karaoke-sudya-AI-addon-v$ver.zip" Karaoke)
 
@@ -152,7 +132,7 @@ jobs:
             echo "---"
             echo "**Что скачать:**"
             echo "- \`Karaoke-sudya-v$ver.zip\` — сама программа (~9 МБ)."
-            echo "- \`Karaoke-sudya-AI-addon-v$ver.zip\` — дополнение «Нейросети» (~210 МБ), по желанию: в «Озвучке» голоса из ролика убираются начисто, а реплики с текстом находятся сами, без интернета. Распакуйте его в ту же папку, что и программу. Обновлять дополнение с каждой версией не обязательно."
+            echo "- \`Karaoke-sudya-AI-addon-v$ver.zip\` — дополнение «Нейросети» (~80 МБ), по желанию: в «Озвучке» голоса из ролика убираются начисто, без интернета. Распакуйте его в ту же папку, что и программу. Обновлять дополнение с каждой версией не обязательно."
             echo
             echo "**Установка:** распакуйте архив в любую папку и запустите \`Karaoke-sudya.exe\`. Для обновления распакуйте поверх — записи и настройки останутся."
           } >> notes.md

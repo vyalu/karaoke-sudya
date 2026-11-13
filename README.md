@@ -91,7 +91,7 @@
 <td width="33%" valign="top">
 
 ### 🎬 Озвучка
-Переозвучьте сцену из фильма. Программа режет ролик на реплики (с дополнением «Нейросети» — вместе с текстом для суфлёра, а голоса из фона убираются начисто), игрок озвучивает его целиком: оригинал → запись → следующий момент, под фон ролика без голосов. Потом следующий игрок берёт тот же ролик — и версии сравниваются.
+Переозвучьте сцену из фильма. Программа режет ролик на реплики (с дополнением «Нейросети» голоса из фона убираются начисто, а реплики находятся точнее; текст для суфлёра берётся из субтитров .srt или вписывается вручную), игрок озвучивает его целиком: оригинал → запись → следующий момент, под фон ролика без голосов. Потом следующий игрок берёт тот же ролик — и версии сравниваются.
 
 Ролики разложены по категориям, а кнопка «Случайный ролик» выберет сцену сама. В конце — **готовое видео с вашими голосами** в mp4. Ролики можно обрезать кусками прямо в программе — точно до кадра, разметка моментов при этом сохраняется.
 
@@ -128,7 +128,7 @@
 
 1. Скачайте архив из [последнего релиза](../../releases/latest):
    - **`Karaoke-sudya-vX.Y.Z.zip`** — программа, ~9 МБ;
-   - **`Karaoke-sudya-AI-addon-vX.Y.Z.zip`** — дополнение «Нейросети», ~210 МБ, по желанию. Распакуйте его в ту же папку, что и программу: в «Озвучке» голоса из ролика будут убираться начисто, а реплики с текстом — находиться сами, без интернета. Ролик обрабатывается один раз при добавлении — от полуминуты до пары минут, смотря по процессору. Нужен процессор с AVX2 (почти любой после 2013 года). Дополнение не нужно обновлять с каждой версией программы.
+   - **`Karaoke-sudya-AI-addon-vX.Y.Z.zip`** — дополнение «Нейросети», ~80 МБ, по желанию. Распакуйте его в ту же папку, что и программу: в «Озвучке» голоса из ролика будут убираться начисто, без интернета. Ролик обрабатывается один раз при добавлении — от полуминуты до пары минут, смотря по процессору. Нужен процессор с AVX2 (почти любой после 2013 года). Дополнение не нужно обновлять с каждой версией программы.
 2. Распакуйте в любую папку — например, на рабочий стол или флешку.
 3. Запустите **`Karaoke-sudya.exe`**.
 
@@ -138,7 +138,7 @@
 ```
 Karaoke\
   Karaoke-sudya.exe   ffmpeg.exe   WebView2Loader.dll   …
-  whisper-cli.exe   kj-demucs.exe   models\   — дополнение «Нейросети» (если поставили)
+  kj-demucs.exe   models\   — дополнение «Нейросети» (если поставили)
   Записи\      — записи выступлений
   Озвучка\     — ролики, разметка моментов, звук без голосов (*.bg); Готовые\ — видео с озвучкой
   Пародист\    — Музыка, Мемы, Животные и ваши наборы звуков
@@ -171,12 +171,12 @@ src/avatar.rs    — Бориска; src/sfx.rs — синтезированны
 src/mimic.rs     — сравнение пародий: интонация, ритм, темп (DTW)
 src/game.rs, sounds.rs   — «Пародист» и его наборы звуков
 src/dub.rs, wave.rs, ff.rs — «Озвучка», волны и редакторы, вызов ffmpeg
-src/speech.rs    — распознавание речи: whisper-cli, модель, субтитры
+src/subtitles.rs — субтитры .srt / .vtt
 src/separate.rs  — отделение голосов от фона (kj-demucs, tools/demucs)
 src/apozh.rs     — «АПОЖ»
 src/theme.rs, ui_kit.rs  — цветовые схемы, шрифты, кнопки и иконки
 third_party/speexdsp     — исходники SpeexDSP (BSD)
-tools/           — сборка ffmpeg, whisper-cli и kj-demucs, скриншоты и баннер для этой страницы
+tools/           — сборка ffmpeg и kj-demucs, скриншоты и баннер для этой страницы
 ```
 </details>
 
@@ -204,7 +204,7 @@ KJ_FFMPEG=ffbuild-linux/ffmpeg cargo test --release --target x86_64-unknown-linu
 cargo build --release --target x86_64-unknown-linux-gnu
 tools/screens.sh && python3 tools/banner.py
 ```
-**Новая версия.** Поменяйте `version` в `Cargo.toml`, добавьте раздел в `CHANGELOG.md` и отправьте в `main` — GitHub Actions соберёт программу, ffmpeg, whisper-cli и kj-demucs, упакует оба архива (модели берутся из релиза [models](../../releases/tag/models) с проверкой SHA-1) и опубликует релиз с описанием из `CHANGELOG.md` (см. `.github/workflows/release.yml`).
+**Новая версия.** Поменяйте `version` в `Cargo.toml`, добавьте раздел в `CHANGELOG.md` и отправьте в `main` — GitHub Actions соберёт программу, ffmpeg и kj-demucs, упакует оба архива (модель берётся из релиза [models](../../releases/tag/models) с проверкой SHA-1) и опубликует релиз с описанием из `CHANGELOG.md` (см. `.github/workflows/release.yml`).
 </details>
 
 <details>
@@ -216,11 +216,10 @@ tools/screens.sh && python3 tools/banner.py
 | [nnnoiseless](https://github.com/jneem/nnnoiseless) (RNNoise) | шумоподавление | BSD |
 | [FFmpeg](https://ffmpeg.org) 7.1, минимальная сборка | резка роликов и сборка видео | LGPL 2.1+ — параметры сборки в `tools/ffmpeg-build.sh` |
 | [egui / eframe](https://github.com/emilk/egui), [wry](https://github.com/tauri-apps/wry), [cpal](https://github.com/RustAudio/cpal), [symphonia](https://github.com/pdeljanov/Symphonia) | окно, встроенный браузер, звук, декодеры | MIT / Apache 2.0 |
-| [whisper.cpp](https://github.com/ggml-org/whisper.cpp) 1.7.4 и модель [Whisper](https://github.com/openai/whisper) base | распознавание речи (дополнение «Нейросети») | MIT |
 | [Demucs](https://github.com/facebookresearch/demucs) (htdemucs) через [demucs.cpp](https://github.com/sevagh/demucs.cpp) | отделение голосов от фона (дополнение «Нейросети») | MIT |
 | Шрифты [Unbounded](https://github.com/googlefonts/unbounded) и [Manrope](https://github.com/sharanda/manrope) | интерфейс | SIL OFL 1.1 |
 
-Тексты лицензий лежат рядом с компонентами: `third_party/speexdsp/COPYING`, `assets/fonts/OFL-*.txt`, `LICENSE-ffmpeg.txt`, `LICENSE-whisper.txt` и `LICENSE-demucs.txt` в архиве с программой.
+Тексты лицензий лежат рядом с компонентами: `third_party/speexdsp/COPYING`, `assets/fonts/OFL-*.txt`, `LICENSE-ffmpeg.txt` и `LICENSE-demucs.txt` в архиве с программой.
 </details>
 
 ## ℹ️ О проекте

@@ -211,7 +211,7 @@ pub fn save_lines(scene: &Path, lines: &[Line]) {
 /// tab column is the phrase's text. Subtitles (.srt / .vtt text) are understood as well.
 pub fn parse_lines(t: &str) -> Option<Vec<Line>> {
     if t.contains("-->") {
-        let v: Vec<Line> = crate::speech::parse_subtitles(t).into_iter().map(|p| Line { start: p.start, end: p.end, text: p.text }).collect();
+        let v: Vec<Line> = crate::subtitles::parse_subtitles(t).into_iter().map(|p| Line { start: p.start, end: p.end, text: p.text }).collect();
         return (!v.is_empty()).then_some(v);
     }
     let num = |s: &str| s.trim().replace(',', ".").parse::<f32>().ok();
@@ -411,60 +411,20 @@ pub struct Dub {
     play_from: Option<(Instant, f32)>,
 }
 
-/// The neural nets at work in the background on one clip.
+/// The neural net taking the voices out of one clip, in the background.
 pub struct Listen {
     scene: PathBuf,
-    /// 1000..1999 — taking the voices out (1000 + per mille), 2000 — listening
+    /// progress, per mille
     stage: std::sync::Arc<std::sync::atomic::AtomicU32>,
-    /// the moments when it started: if the user changes them meanwhile, only the texts are taken
-    before: Vec<Line>,
-    /// (phrases if asked, background without voices if made)
-    job: std::thread::JoinHandle<Result<(Option<Vec<Line>>, Option<Vec<f32>>), String>>,
+    /// the moments when it started; if they are still the automatic ones, they are cut anew
+    /// on the voices alone (much cleaner than on the whole sound)
+    before: Option<Vec<Line>>,
+    /// (the background without voices, the moments found on the voices)
+    job: std::thread::JoinHandle<Result<(Vec<f32>, Vec<Line>), String>>,
 }
 impl Listen {
     pub fn status(&self) -> String {
-        match self.stage.load(std::sync::atomic::Ordering::Relaxed) {
-            s if s < 2000 => format!("Нейросеть убирает голоса из ролика… {}%", (s - 1000) / 10),
-            _ => "Нейросеть слушает ролик и ищет реплики…".into(),
-        }
-    }
-}
-
-/// Whisper's phrases → moments: edges pulled in to where the voice really is, never overlapping.
-pub fn fit_phrases(ph: Vec<crate::speech::Phrase>, voiced: &[(f32, f32)], dur: f32) -> Vec<Line> {
-    let mut out: Vec<Line> = Vec::new();
-    for p in ph {
-        let (a, b) = (p.start.max(0.0), p.end.min(dur));
-        if b - a < 0.15 { continue; }
-        // voiced stretches that touch this phrase
-        let touch: Vec<&(f32, f32)> = voiced.iter().filter(|(s, e)| e.min(b) - s.max(a) > (0.5 * (e - s)).min(0.25)).collect();
-        let (mut s, mut e) = match (touch.first(), touch.last()) {
-            // tighten to the voice, or widen up to 0.3 s where the voice goes on past whisper's edge
-            (Some(f), Some(l)) => (if f.0 >= a { (f.0 - 0.1).max(a) } else { f.0.max(a - 0.3) },
-                                   if l.1 <= b { (l.1 + 0.1).min(b) } else { l.1.min(b + 0.3) }),
-            _ => (a, b),
-        };
-        s = s.max(0.0); e = e.min(dur);
-        if let Some(prev) = out.last_mut() {
-            if s < prev.end + 0.06 {
-                let mid = ((prev.end + s) / 2.0).max(prev.start + 0.3);
-                prev.end = mid - 0.03;
-                s = mid + 0.03;
-            }
-        }
-        if e - s >= 0.3 { out.push(Line { start: s, end: e, text: p.text }); }
-    }
-    out
-}
-
-/// Put texts onto moments the user has drawn: each takes the phrases it overlaps most.
-fn texts_onto(lines: &mut [Line], found: &[Line]) {
-    for l in lines.iter_mut().filter(|l| l.text.trim().is_empty()) {
-        let t: Vec<&str> = found.iter().filter(|f| {
-            let ov = f.end.min(l.end) - f.start.max(l.start);
-            ov > 0.5 * (f.end - f.start).min(l.end - l.start)
-        }).map(|f| f.text.as_str()).collect();
-        l.text = t.join(" ");
+        format!("Нейросеть убирает голоса из ролика… {}%", self.stage.load(std::sync::atomic::Ordering::Relaxed) / 10)
     }
 }
 
@@ -531,8 +491,7 @@ impl Dub {
     /// so the moments don't change under the player's takes.
     fn cleaning(&self) -> Option<String> {
         let l = self.listen.as_ref().filter(|l| Some(&l.scene) == self.scene.as_ref())?;
-        let s = l.stage.load(std::sync::atomic::Ordering::Relaxed);
-        Some(if s < 2000 { format!("Подождите — нейросеть убирает голоса из ролика: {}%", (s - 1000) / 10) } else { "Подождите — нейросеть ищет реплики…".to_string() })
+        Some(format!("Подождите — нейросеть убирает голоса из ролика: {}%", l.stage.load(std::sync::atomic::Ordering::Relaxed) / 10))
     }
     /// Somebody has already recorded something on this clip.
     fn any_takes(&self) -> bool { self.takes.iter().any(|v| v.iter().any(|t| t.is_some())) }
@@ -853,7 +812,6 @@ fn moments_editor(ui: &mut egui::Ui, d: &mut Dub, width: f32, head: Option<f32>,
         // tools
         let word = if d.cut_mode { "+ Кусок" } else { "+ Момент" };
         if ui.add(egui::Button::new(RichText::new(word).font(semibold(13.0)).color(TEXT())).fill(CHIP()).corner_radius(8.0).min_size(Vec2::new(0.0, 34.0))).on_hover_text("Добавить у курсора (или протяните мышью по пустому месту)").clicked() { *act = Some((33, 0)); }
-        if !d.cut_mode && crate::speech::available() && d.listen.is_none() && kit::button_ex(ui, Kind::Ghost, "Найти реплики", Some(Icon::Mic), Vec2::new(0.0, 34.0), semibold(13.0), 8).on_hover_text("Нейросеть сама разметит, где говорят, и запишет текст реплик").clicked() { *act = Some((50, 0)); }
         if !d.cut_mode && ui.add(egui::Button::new(RichText::new("✂ Обрезать ролик").font(semibold(13.0)).color(TEXT_2())).fill(CHIP()).corner_radius(8.0).min_size(Vec2::new(0.0, 34.0))).on_hover_text("Вырезать лишнее из самого ролика").clicked() { *act = Some((21, 0)); }
         // zoom, on the right
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1117,45 +1075,35 @@ impl App {
                 let long = d.dur() >= MAX_SECS - 0.5;
                 if d.video { self.pending_video = Some(file_url(&p)); }
                 if long { self.say("Ролик длинный — взял первые 3 минуты"); }
-                let words = fresh && crate::speech::available();
                 let sep = self.dub.as_ref().map(|d| d.clean.is_none()).unwrap_or(false) && crate::separate::available();
-                if play { self.dub_begin(); } else if !words { self.boris.queue("Редактор! Подвиньте моменты, если где-то лишнее.".into()); }
-                if words || sep { self.dub_listen(words); }
+                if play { self.dub_begin(); } else { self.boris.queue("Редактор! Подвиньте моменты, если где-то лишнее.".into()); }
+                if sep { self.dub_listen(fresh); }
             }
             Err(e) => { d.loading = false; self.say(format!("Не получилось прочитать звук ролика: {e}")); }
         }
     }
 
-    /// The neural nets at work on the open clip, in the background: take the voices out of its
-    /// sound (once, kept next to the clip) and, if `words`, find the phrases and their text.
-    fn dub_listen(&mut self, words: bool) {
+    /// The neural net takes the voices out of the open clip's sound, in the background (once,
+    /// kept next to the clip). `fresh` — the moments are the automatic ones: cut them again on
+    /// the voices alone when it's done.
+    fn dub_listen(&mut self, fresh: bool) {
         let Some(d) = &mut self.dub else { return };
-        if d.listen.is_some() { return; }
+        if d.listen.is_some() || d.clean.is_some() || !crate::separate::available() { return; }
         let Some(scene) = d.scene.clone() else { return };
-        let words = words && crate::speech::available();
-        let sep = d.clean.is_none() && crate::separate::available();
-        if !words && !sep { self.say("Распознавание речи и очистка голосов — в дополнении «Нейросети» (скачивается рядом с программой в релизе)"); return; }
-        let (x, side, sr, dur) = (d.orig.clone(), d.side.clone(), d.sr, d.dur());
-        let clean = d.clean.clone();
-        let stage = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(if sep { 1000 } else { 2000 }));
+        let (x, side, sr) = (d.orig.clone(), d.side.clone(), d.sr);
+        let stage = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let st = stage.clone();
         let sc = scene.clone();
         let job = std::thread::spawn(move || {
             use std::sync::atomic::Ordering;
-            let made = if sep {
-                let bg = crate::separate::background(&x, &side, sr, &|p| st.store(1000 + ((p * 999.0) as u32).min(999), Ordering::Relaxed))?;
-                crate::separate::save_cache(&sc, &bg, sr);
-                Some(bg)
-            } else { None };
-            if !words { return Ok((None, made)); }
-            // the voices alone are clearer to recognise and to find
-            let voice: Vec<f32> = match made.as_ref().or(clean.as_ref()) { Some(bg) => x.iter().zip(bg).map(|(a, b)| a - b).collect(), None => x.clone() };
-            st.store(2000, Ordering::Relaxed);
-            let ph = crate::speech::transcribe(&voice, sr)?;
-            Ok((Some(fit_phrases(ph, &segment(&voice, sr, SENS), dur)), made))
+            let bg = crate::separate::background(&x, &side, sr, &|p| st.store(((p * 999.0) as u32).min(999), Ordering::Relaxed))?;
+            crate::separate::save_cache(&sc, &bg, sr);
+            let voice: Vec<f32> = x.iter().zip(&bg).map(|(a, b)| a - b).collect();
+            let lines = segment(&voice, sr, SENS).into_iter().map(|(a, b)| Line::new(a, b)).collect();
+            Ok((bg, lines))
         });
-        d.listen = Some(Listen { scene, stage, before: d.lines.clone(), job });
-        self.boris.queue(if words { "Сейчас послушаю ролик и сам найду, кто где говорит!" } else { "Убираю голоса из ролика — фон будет чище!" }.into());
+        d.listen = Some(Listen { scene, stage, before: fresh.then(|| d.lines.clone()), job });
+        self.boris.queue("Убираю голоса из ролика — фон будет чище!".into());
     }
 
     /// Play the original of a line: the video (silent) + our own copy of its sound.
@@ -1388,34 +1336,24 @@ impl App {
             let res = l.job.join().unwrap_or_else(|_| Err("сбой".into()));
             // the clip was deleted while the net worked on it
             if !l.scene.exists() { let _ = std::fs::remove_file(crate::separate::cache_path(&l.scene)); }
-            if let Ok((_, Some(bg))) = &res {
-                let d = self.dub.as_mut().unwrap();
-                if d.scene.as_ref() == Some(&l.scene) && bg.len() == d.orig.len() { d.clean = Some(bg.clone()); }
-            }
-            match res.map(|(f, bg)| (f, bg.is_some())) {
-                Ok((None, true)) => self.say("Голоса из ролика убраны — фон под записью будет чистым"),
-                Ok((None, false)) => {}
-                Ok((Some(found), _)) if found.is_empty() => self.say("Нейросеть не услышала речи — моменты остались по громкости"),
-                Ok((Some(found), _)) => {
-                    let n = found.len();
+            match res {
+                Ok((bg, found)) => {
                     let d = self.dub.as_mut().unwrap();
-                    let open = d.scene.as_ref() == Some(&l.scene) && !d.cut_mode;
-                    // the moments are only replaced while nobody has recorded on them yet
-                    if open && d.lines == l.before && !d.any_takes() {
-                        let n_lines = found.len();
+                    let open = d.scene.as_ref() == Some(&l.scene);
+                    if open && bg.len() == d.orig.len() { d.clean = Some(bg); }
+                    // automatic moments that nobody touched or recorded on: cut again on the voices
+                    let auto = |cur: &[Line]| l.before.as_deref() == Some(cur) && !found.is_empty();
+                    if open && !d.cut_mode && auto(&d.lines) && !d.any_takes() {
+                        let n = found.len();
                         d.lines = found; d.sel = None; d.cur = 0; d.refc = None; d.save();
-                        for v in &mut d.takes { *v = vec![None; n_lines]; }
-                        self.say(format!("Нейросеть нашла реплик: {n}"));
-                    } else if open {
-                        texts_onto(&mut d.lines, &found); d.save();
-                        self.say("Моменты уже в работе — добавил к ним только текст");
+                        for v in &mut d.takes { *v = vec![None; n]; }
+                        self.say(format!("Голоса убраны, моменты найдены заново по голосам: {n}"));
+                    } else if !open && load_lines(&l.scene).map(|c| auto(&c)).unwrap_or(false) {
+                        save_lines(&l.scene, &found);
+                        self.say(format!("Голоса из «{}» убраны", scene_name(&l.scene)));
                     } else {
-                        let mut cur = load_lines(&l.scene).unwrap_or_default();
-                        if cur == l.before { cur = found; } else { texts_onto(&mut cur, &found); }
-                        save_lines(&l.scene, &cur);
-                        self.say(format!("Реплики для «{}» найдены", scene_name(&l.scene)));
+                        self.say("Голоса из ролика убраны — фон под записью будет чистым");
                     }
-                    self.boris.queue("Готово! Проверьте реплики — я мог чуть промахнуться по краям.".into());
                 }
                 Err(e) => self.say(e),
             }
@@ -1949,7 +1887,6 @@ impl App {
                 d.save(); d.takes.clear();
             },
             9 => self.dub_goto(i),
-            50 => self.dub_listen(true),
             51 => if let Some(d) = &self.dub { d.save(); },
             22 => { self.dub_stop_play(); let c = self.dub.as_ref().map(|d| d.cur).unwrap_or(0); self.dub_goto(c); }
             23 => { let n = self.dub.as_ref().map(|d| d.next_open(d.cur)).unwrap_or(0); self.dub_goto(n); }
@@ -2226,21 +2163,8 @@ mod tests {
 
 
     #[test]
-    fn phrases_become_moments_with_text() {
-        use crate::speech::Phrase;
-        // whisper's coarse times: 0–4.8, 4.8–6.0, 6–12; the voice really is at 1.0–4.6, 4.9–5.6, 8.3–11.0
-        let ph = vec![
-            Phrase { start: 0.0, end: 4.8, text: "Привет, болото, ты кто такой?".into() },
-            Phrase { start: 4.8, end: 6.0, text: "Я осёл.".into() },
-            Phrase { start: 6.0, end: 12.0, text: "Давай уйдём отсюда.".into() },
-        ];
-        let voiced = [(1.0, 4.6), (4.9, 5.6), (8.3, 11.0)];
-        let v = fit_phrases(ph, &voiced, 13.0);
-        assert_eq!(v.len(), 3);
-        assert!((v[0].start - 0.9).abs() < 0.05 && v[0].end < v[1].start, "{v:?}");
-        assert!((v[2].start - 8.2).abs() < 0.05 && (v[2].end - 11.1).abs() < 0.05, "{v:?}");
-        assert_eq!(v[1].text, "Я осёл.");
-        // the text survives the moments file, old numeric extra columns don't become text
+    fn moments_keep_their_text() {
+        let v = vec![Line { start: 0.9, end: 4.7, text: "Привет, болото, ты кто такой?".into() }, Line::new(8.2, 11.1)];
         let dir = std::env::temp_dir().join(format!("kj_txt_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let sc = dir.join("a.mp4");
@@ -2252,26 +2176,11 @@ mod tests {
         std::fs::write(dir.join("Шрек.srt"), "1\n00:00:01,000 --> 00:00:02,000\nЭто болото!\n").unwrap();
         assert_eq!(load_lines(&sc2).unwrap()[0].text, "Это болото!");
         let _ = std::fs::remove_dir_all(&dir);
-        // hand-drawn moments get the words they cover
-        let mut mine = vec![Line::new(0.5, 6.0), Line::new(8.0, 11.5)];
-        texts_onto(&mut mine, &v);
-        assert_eq!(mine[0].text, "Привет, болото, ты кто такой? Я осёл.");
         assert_eq!(split_text("раз два три четыре", 0.5), ("раз два".into(), "три четыре".into()));
         // a cut keeps the moments where they were in the picture
         let m = vec![Line { start: 2.0, end: 3.0, text: "а".into() }, Line::new(5.0, 6.0), Line::new(10.5, 11.5)];
         let v = move_moments(&m, &[(1.0, 4.0), (9.0, 12.0)]);
         assert_eq!(v, vec![Line { start: 1.0, end: 2.0, text: "а".into() }, Line::new(4.5, 5.5)]);
-    }
-
-    /// The whole neural path on a real recording (KJ_WHISPER, KJ_WHISPER_MODEL, KJ_WHISPER_SAMPLE); skipped otherwise.
-    #[test]
-    fn listens_to_a_clip() {
-        let (true, Ok(w)) = (crate::speech::available(), std::env::var("KJ_WHISPER_SAMPLE")) else { return };
-        let (x, sr) = audio::load_mono(Path::new(&w), 60.0).unwrap();
-        let ph = crate::speech::transcribe(&x, sr).unwrap();
-        let v = fit_phrases(ph, &segment(&x, sr, 0.5), x.len() as f32 / sr as f32);
-        for l in &v { println!("{:.2}–{:.2}  {}", l.start, l.end, l.text); }
-        assert!(v.len() >= 2 && v.windows(2).all(|p| p[0].end < p[1].start));
     }
 
     #[test]
