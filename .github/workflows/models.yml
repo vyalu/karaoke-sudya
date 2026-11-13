@@ -26,3 +26,25 @@ jobs:
         run: |
           gh release view models >/dev/null 2>&1 || gh release create models --prerelease --target models --title "Модели распознавания речи" --notes "Модель Whisper base (whisper.cpp, MIT) для разметки моментов в «Озвучке». Программа скачивает её сама при первом использовании. SHA-1: 465707469ff3a37a2b9b8d8f89f2f99de7299dac"
           gh release upload models ggml-base.bin --clobber
+
+  demucs:
+    # Модель разделения голоса и фона (htdemucs, Meta, MIT) в формате demucs.cpp.
+    # Конвертируется здесь же из официальных весов Demucs скриптом demucs.cpp.
+    runs-on: ubuntu-24.04
+    needs: mirror
+    steps:
+      - name: Конвертировать htdemucs
+        run: |
+          git clone https://github.com/sevagh/demucs.cpp dcpp
+          git -C dcpp checkout 4edae497a114de1ccb17ac9b4a2b8fc0144714d7
+          python3 -m venv venv
+          venv/bin/pip install -q torch --index-url https://download.pytorch.org/whl/cpu
+          venv/bin/pip install -q demucs==4.0.1 numpy
+          venv/bin/python dcpp/scripts/convert-pth-to-ggml.py out
+          ls -l out
+          mv out/ggml-model-htdemucs-4s-f16.bin ggml-htdemucs-4s-f16.bin
+          sha1sum ggml-htdemucs-4s-f16.bin | tee ggml-htdemucs-4s-f16.bin.sha1
+      - name: Выложить
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload models ggml-htdemucs-4s-f16.bin ggml-htdemucs-4s-f16.bin.sha1 --clobber -R ${{ github.repository }}
