@@ -1,0 +1,28 @@
+# Зеркало модели распознавания речи для «Караоке-судьи».
+# Скачивает официальную модель whisper.cpp, сверяет SHA-1 из whisper.cpp/models/README.md
+# и выкладывает её в пре-релиз «models». Программа качает модель отсюда (запасной путь — Hugging Face).
+name: Models
+
+on:
+  push:
+    branches: [models]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Скачать и проверить
+        run: |
+          curl -sSL -o ggml-base.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin
+          echo "465707469ff3a37a2b9b8d8f89f2f99de7299dac  ggml-base.bin" | sha1sum -c -
+      - name: Пре-релиз «models»
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view models >/dev/null 2>&1 || gh release create models --prerelease --target models --title "Модели распознавания речи" --notes "Модель Whisper base (whisper.cpp, MIT) для разметки моментов в «Озвучке». Программа скачивает её сама при первом использовании. SHA-1: 465707469ff3a37a2b9b8d8f89f2f99de7299dac"
+          gh release upload models ggml-base.bin --clobber
