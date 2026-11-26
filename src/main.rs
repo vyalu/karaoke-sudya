@@ -161,12 +161,19 @@ struct Settings {
     scheme: usize,
     /// auto-tune for the monitor: 0 off, 1 soft, 2 «робот»
     autotune: u8,
+    /// how late the voice comes back after the music (ms), measured for speakers and headphones
+    /// separately — Bluetooth headphones are much slower
+    lat_speakers: u32,
+    lat_phones: u32,
 }
 impl Default for Settings {
     fn default() -> Self { Self { speakers: true, monitor: 0.4, reverb: 0.3, echo: 0.1, aec: true, denoise: false, mic_gain: 1.0, input: None, best: 0, history: vec![],
-        voice_low: 0.0, voice_high: 0.0, crowd_sfx: true, songs_total: 0, longest_best: 0.0, achs: vec![], players: vec![], singer: 0, scheme: 0, autotune: 0 } }
+        voice_low: 0.0, voice_high: 0.0, crowd_sfx: true, songs_total: 0, longest_best: 0.0, achs: vec![], players: vec![], singer: 0, scheme: 0, autotune: 0, lat_speakers: 0, lat_phones: 0 } }
 }
 impl Settings {
+    /// The measured delay for the current output (seconds).
+    fn latency(&self) -> f32 { (if self.speakers { self.lat_speakers } else { self.lat_phones }) as f32 / 1000.0 }
+    fn latency_mut(&mut self) -> &mut u32 { if self.speakers { &mut self.lat_speakers } else { &mut self.lat_phones } }
     fn has(&self, id: &str) -> bool { self.achs.iter().any(|(a, _)| a == id) }
     /// Grant an achievement; returns its title if it is new.
     fn grant(&mut self, id: &str) -> Option<&'static str> {
@@ -199,6 +206,8 @@ impl Settings {
                     "singer" => s.singer = v.parse().unwrap_or(0),
                     "scheme" => s.scheme = v.parse().unwrap_or(0),
                     "autotune" => s.autotune = v.parse::<u8>().unwrap_or(0).min(2),
+                    "lat_speakers" => s.lat_speakers = v.parse::<u32>().unwrap_or(0).min(800),
+                    "lat_phones" => s.lat_phones = v.parse::<u32>().unwrap_or(0).min(800),
                     "ach" => { if let Some((id, w)) = v.split_once('\t') { s.achs.push((id.into(), w.into())); } }
                     "h" => {
                         let p: Vec<&str> = v.splitn(3, '\t').collect();
@@ -219,7 +228,7 @@ impl Settings {
             self.voice_low, self.voice_high, self.crowd_sfx as u8, self.songs_total, self.longest_best));
         for (id, w) in &self.achs { t.push_str(&format!("ach={id}\t{w}\n")); }
         for p in &self.players { t.push_str(&format!("player={}\n", p.replace('\n', " "))); }
-        t.push_str(&format!("singer={}\nscheme={}\nautotune={}\n", self.singer, self.scheme, self.autotune));
+        t.push_str(&format!("singer={}\nscheme={}\nautotune={}\nlat_speakers={}\nlat_phones={}\n", self.singer, self.scheme, self.autotune, self.lat_speakers, self.lat_phones));
         for h in self.history.iter().take(30) {
             t.push_str(&format!("h={}\t{}\t{}\n", h.score, h.title.replace(['\t', '\n'], " "), h.when));
         }
@@ -617,6 +626,8 @@ struct App {
     // microphone check
     mic_test: Option<audio::MicTest>,
     mic_test_user: bool,
+    /// the delay measurement running in «Звук»
+    lat_test: Option<audio::LatencyTest>,
     mic_err: Option<String>,
     mic_heard: Option<Instant>,
     // recordings
@@ -674,7 +685,7 @@ impl App {
             in_session: false, song: None, video: None, video_hidden: false, video_rect: None,
             video_shared: Arc::new(Mutex::new(VideoShared::default())), pending_video: None, close_video: false, fullscreen: false,
             voice_hist: VecDeque::new(), last_bar: Instant::now(),
-            mic_test: None, mic_test_user: false, mic_err: None, mic_heard: None,
+            mic_test: None, mic_test_user: false, lat_test: None, mic_err: None, mic_heard: None,
             show_recs: false, recs: vec![], player: None, confirm_delete: None,
             boris: avatar::Boris::default(), last_frame: Instant::now(), voice_level: 0.0,
             sing: None, pitch_center: 0.0, music_level: 0.0, default_out: audio::default_output_name(),
@@ -694,6 +705,7 @@ impl App {
             app.mic_heard = Some(Instant::now());
             match which.as_str() {
                 "games" => app.show_games = true,
+                "sound" => app.show_settings = true,
                 "parodist" => { app.game = Some(game::Game::demo(players.clone())); app.show_game = true; app.boris.queue("Очко получает Макс! Качество 86 из 100. Это шедевр!".into()); }
                 "dub" => { app.dub = Some(dub::Dub::demo(players.clone(), false)); app.show_dub = true; app.boris.queue("Микрофон у Макса! Не подведи.".into()); }
                 "dubsetup" => app.open_dub(),
@@ -738,6 +750,7 @@ impl App {
             output_name: None,
             record_dir: record_dir(),
             auto,
+            latency: self.settings.latency(),
         };
         match Engine::start(cfg, self.params.clone()) {
             Ok(e) => { self.engine = Some(e); self.in_session = true; }
@@ -2063,6 +2076,72 @@ impl App {
 
     /* =================== SETTINGS MODAL =================== */
 
+    /// «Задержка звука»: measure (say «та» with the clicks) or set by hand, per output.
+    fn latency_panel(&mut self, ui: &mut egui::Ui, colw: f32, running: bool) {
+        egui::Frame::new().fill(SURFACE_2()).corner_radius(16.0).inner_margin(16.0).show(ui, |ui| {
+            ui.set_width(colw - 32.0);
+            let out = if self.settings.speakers { "колонок" } else { "наушников" };
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("Задержка {out}")).font(semibold(15.0)));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    let busy = self.lat_test.is_some();
+                    if ui.add_enabled(!busy, egui::Button::new(RichText::new("+").font(bold(15.0))).fill(CHIP()).min_size(Vec2::new(30.0, 28.0))).on_hover_text("+10 мс").clicked() {
+                        let v = self.settings.latency_mut(); *v = (*v + 10).min(800); self.settings.save();
+                    }
+                    let ms = *self.settings.latency_mut();
+                    ui.label(RichText::new(format!("{ms:>3} мс")).font(FontId::monospace(14.0)).color(if ms == 0 { MUTED() } else { TEXT() }));
+                    if ui.add_enabled(!busy, egui::Button::new(RichText::new("−").font(bold(15.0))).fill(CHIP()).min_size(Vec2::new(30.0, 28.0))).on_hover_text("−10 мс").clicked() {
+                        let v = self.settings.latency_mut(); *v = v.saturating_sub(10); self.settings.save();
+                    }
+                });
+            });
+            ui.add_space(6.0);
+            match &self.lat_test {
+                Some(t) => {
+                    let b = t.beat();
+                    // the beat: count-in dots grey, then one dot per click
+                    let (r, _) = ui.allocate_exact_size(Vec2::new(colw - 32.0, 22.0), egui::Sense::hover());
+                    let n = audio::LT_CLICKS;
+                    for k in 0..n {
+                        let c = Pos2::new(r.left() + 10.0 + k as f32 * ((r.width() - 20.0) / (n - 1) as f32), r.center().y);
+                        let lit = k + 1 == b;
+                        let col = if k < audio::LT_LEAD { MUTED() } else { ACCENT() };
+                        ui.painter().circle_filled(c, if lit { 8.0 } else { 4.0 }, if lit || k + 1 < b { col } else { col.gamma_multiply(0.3) });
+                    }
+                    ui.add_space(4.0);
+                    let msg = if b <= audio::LT_LEAD { "Слушайте щелчки — сейчас начнём…" } else { "Говорите «та» точно вместе с каждым щелчком" };
+                    ui.label(RichText::new(msg).font(semibold(14.0)).color(ACCENT_TEXT()));
+                    ui.ctx().request_repaint_after(Duration::from_millis(30));
+                }
+                None => {
+                    if !running && kit::primary(ui, "Измерить", Some(Icon::Play)).clicked() {
+                        self.mic_test = None; self.mic_test_user = false;
+                        match audio::LatencyTest::start(&self.settings.input, self.params.clone()) {
+                            Ok(t) => self.lat_test = Some(t),
+                            Err(e) => self.say(e),
+                        }
+                    }
+                    ui.add_space(6.0);
+                    kit::text(ui, "Насколько голос отстаёт от музыки: программа щёлкает, вы говорите «та» в такт — и записи, и озвучка выравниваются сами. Меряется отдельно для колонок и наушников; с Bluetooth-наушниками обязательно.", body(13.0), MUTED(), colw - 32.0);
+                }
+            }
+        });
+        // the test is over
+        if let Some(r) = self.lat_test.as_ref().and_then(|t| t.result()) {
+            self.lat_test = None;
+            match r {
+                Ok(sec) => {
+                    let ms = (sec * 1000.0).round() as u32;
+                    *self.settings.latency_mut() = ms;
+                    self.settings.save();
+                    self.say(format!("Задержка — {ms} мс. Теперь голос в записях встанет ровно на музыку"));
+                }
+                Err(e) => self.say(e),
+            }
+        }
+    }
+
     fn settings_modal(&mut self, ctx: &egui::Context) {
         if !self.show_settings { return; }
         let screen = ctx.screen_rect();
@@ -2186,6 +2265,8 @@ impl App {
                             kit::text(ui, "Скажите что-нибудь — деления должны загораться. Если шкала не двигается, выберите другой микрофон.", body(13.0), MUTED(), colw - 32.0);
                         });
                         if kit::link(ui, "Открыть Параметры → Конфиденциальность → Микрофон").clicked() { open("ms-settings:privacy-microphone"); }
+                        ui.add_space(12.0);
+                        self.latency_panel(ui, colw, running);
                     });
                     // right column
                     ui.allocate_ui_with_layout(Vec2::new(colw, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
@@ -2264,7 +2345,7 @@ impl App {
                     if kit::button_ex(ui, Kind::Primary, "Готово", None, Vec2::new(140.0, 48.0), bold(15.0), 12).clicked() { close = true; }
                 });
             });
-        if close || ctx.input(|i| i.key_pressed(egui::Key::Escape)) { self.show_settings = false; }
+        if close || ctx.input(|i| i.key_pressed(egui::Key::Escape)) { self.show_settings = false; self.lat_test = None; }
     }
 
     fn start_mic_test(&mut self, user: bool) {

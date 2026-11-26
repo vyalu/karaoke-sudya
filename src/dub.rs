@@ -1285,6 +1285,9 @@ impl App {
         let (mut s, sr) = d.mic.as_ref().map(|m| (m.end(), m.sr)).unwrap_or_default();
         // take the background we played out of the recording, so it is not doubled in the result
         if let Some(r) = d.rec_ref.take() { s = crate::cleanup::remove_known(&s, sr, &r, d.sr); }
+        // the voice comes back late by the measured delay: move the take earlier by it
+        let late = ((self.settings.latency() * sr as f32) as usize).min(s.len());
+        s.drain(..late);
         let (w, n) = (d.who, d.lines.len());
         if d.takes.len() <= w { d.takes.resize(w + 1, vec![]); }
         d.takes[w].resize(n, None);

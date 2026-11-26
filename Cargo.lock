@@ -2247,7 +2247,7 @@ dependencies = [
 
 [[package]]
 name = "karaoke"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "cc",
  "cpal",
@@ -2257,6 +2257,7 @@ dependencies = [
  "native-tls",
  "nnnoiseless",
  "rfd",
+ "rtrb",
  "rustfft",
  "serde_json",
  "symphonia",
@@ -3578,6 +3579,12 @@ dependencies = [
  "web-sys",
  "windows-sys 0.59.0",
 ]
+
+[[package]]
+name = "rtrb"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "342e1478a6e1c839e7405033eabfdc954d4d5dabd39f34e83420a43a95acfb04"
 
 [[package]]
 name = "rustc-hash"

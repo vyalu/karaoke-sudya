@@ -6,7 +6,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SizedSample};
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -69,23 +69,71 @@ impl Default for Status {
 #[allow(dead_code)]
 pub struct Outcome { pub score: u32, pub recording: Option<PathBuf>, pub sang_secs: f32, pub longest_note: f32, pub best_start: Option<f32> }
 
-/* ---------- ring buffers shared with callbacks ---------- */
+/* ---------- lock-free lanes from the audio callbacks ---------- */
+// Every lane has exactly one writer (an audio callback) and one reader, so no audio callback ever
+// waits for a lock: a slow frame of the analysis or the window can't make the sound crackle.
+// If a reader stalls and its lane fills up, the newest samples are dropped.
 
+type Tx<T> = rtrb::Producer<T>;
+type Rx<T> = rtrb::Consumer<T>;
+fn put<T>(p: &mut Tx<T>, x: T) { let _ = p.push(x); }
+/// Everything waiting in a lane → the end of `q` (keeping at most `cap`).
+fn drain_into(c: &mut Rx<f32>, q: &mut VecDeque<f32>, cap: usize) {
+    if let Ok(ch) = c.read_chunk(c.slots()) {
+        let (a, b) = ch.as_slices();
+        q.extend(a);
+        q.extend(b);
+        ch.commit_all();
+    }
+    while q.len() > cap { q.pop_front(); }
+}
+
+/// What the microphone callback writes.
+struct MicTx { mic_raw: Tx<f32>, mic_an: Tx<f32>, rec_voice: Tx<f32> }
+/// What the speakers callback writes.
+struct OutTx { mon_an: Tx<f32> }
+/// What the loopback (system sound) callback writes.
+struct LoopTx { loop_an: Tx<f32>, rec_loop: Tx<f32>, last_loop: Arc<AtomicU64>, base: Instant }
+impl LoopTx {
+    /// The system sound is coming in right now.
+    fn touch(&self) { self.last_loop.store(self.base.elapsed().as_micros() as u64 + 1, Ordering::Relaxed); }
+}
+/// The reading ends, in the analysis thread.
+struct Lanes { mic_raw: Rx<f32>, mic_an: Rx<f32>, mon_an: Rx<f32>, loop_an: Rx<f32>, rec_voice: Rx<f32>, rec_loop: Rx<f32>, last_loop: Arc<AtomicU64>, base: Instant }
+
+fn lanes(out_sr: u32) -> (MicTx, OutTx, LoopTx, Lanes) {
+    let lane = |n: usize| rtrb::RingBuffer::<f32>::new(n);
+    let rec = out_sr as usize * 4;
+    let ((a, a2), (b, b2), (c, c2), (d, d2), (e, e2), (f, f2)) = (lane(1 << 16), lane(1 << 16), lane(1 << 16), lane(1 << 16), lane(rec), lane(rec));
+    let last = Arc::new(AtomicU64::new(0));
+    let base = Instant::now();
+    (MicTx { mic_raw: a, mic_an: b, rec_voice: e }, OutTx { mon_an: c },
+     LoopTx { loop_an: d, rec_loop: f, last_loop: last.clone(), base },
+     Lanes { mic_raw: a2, mic_an: b2, mon_an: c2, loop_an: d2, rec_voice: e2, rec_loop: f2, last_loop: last, base })
+}
+
+/// The analysis thread's own buffers, filled from the lanes.
 #[derive(Default)]
 struct Rings {
     mic_an: VecDeque<f32>,   // cleaned mic mono @ mic rate (pitch)
     mic_raw: VecDeque<f32>,  // raw mic mono @ mic rate (voice/music separation)
-    mon_out: VecDeque<[f32; 2]>,  // processed stereo voice @ out rate (to play)
     mon_an: VecDeque<f32>,   // what we actually played @ out rate (analysis)
     loop_an: VecDeque<f32>,  // system loopback mono @ out rate (analysis)
-    aec_ref: VecDeque<f32>,  // system loopback mono @ out rate (echo canceller reference)
     rec_voice: VecDeque<f32>,
     rec_loop: VecDeque<f32>,
     last_loop: Option<Instant>,
 }
-fn push_capped(q: &mut VecDeque<f32>, x: f32, cap: usize) {
-    if q.len() >= cap { q.pop_front(); }
-    q.push_back(x);
+impl Lanes {
+    fn fill(&mut self, r: &mut Rings) {
+        drain_into(&mut self.mic_an, &mut r.mic_an, 16384);
+        drain_into(&mut self.mic_raw, &mut r.mic_raw, 16384);
+        drain_into(&mut self.mon_an, &mut r.mon_an, 16384);
+        drain_into(&mut self.loop_an, &mut r.loop_an, 16384);
+        drain_into(&mut self.rec_voice, &mut r.rec_voice, usize::MAX);
+        drain_into(&mut self.rec_loop, &mut r.rec_loop, usize::MAX);
+        let t = self.last_loop.load(Ordering::Relaxed);
+        r.last_loop = (t > 0).then(|| self.base + Duration::from_micros(t - 1));
+    }
 }
 
 pub struct EngineConfig {
@@ -95,6 +143,9 @@ pub struct EngineConfig {
     pub record_dir: PathBuf,
     /// wait for music to start before calibrating; stop automatically when it ends
     pub auto: bool,
+    /// the measured delay from the music leaving the program to the voice coming back (seconds):
+    /// the recording moves the music by it, so voice and music line up
+    pub latency: f32,
 }
 
 pub struct Engine {
@@ -149,14 +200,17 @@ impl Engine {
         let in_sr = in_cfg.sample_rate.0;
         let out_sr = out_cfg.sample_rate.0;
 
-        let rings = Arc::new(Mutex::new(Rings::default()));
+        let (mut mic_tx, mut out_tx, mut loop_tx, lanes) = lanes(out_sr);
+        // the processed voice to play (mic → speakers) and the system sound for the echo canceller
+        let cap_play = (out_sr as f32 * 0.25) as usize;
+        let (mut mon_tx, mut mon_rx) = rtrb::RingBuffer::<[f32; 2]>::new(cap_play);
+        let (mut aec_tx, mut aec_rx) = rtrb::RingBuffer::<f32>::new(1 << 15);
         let recording = Arc::new(AtomicBool::new(true));
         let err = |e: cpal::StreamError| eprintln!("stream error: {e}");
         let mut streams = Vec::new();
 
         /* --- microphone --- */
         {
-            let rings = rings.clone();
             let params = params.clone();
             let rec = recording.clone();
             let ch = in_cfg.channels as usize;
@@ -167,10 +221,7 @@ impl Engine {
             let mut mono: Vec<f32> = Vec::with_capacity(4096);
             let mut cleaned: Vec<f32> = Vec::with_capacity(8192);
             let mut rs = Resampler::new(in_sr, out_sr);
-            let cap_play = (out_sr as f32 * 0.25) as usize;
-            let max_lat = (out_sr as f32 * 0.045) as usize;
-            let tgt_lat = (out_sr as f32 * 0.015) as usize;
-            let cap_rec = out_sr as usize * 10;
+            let mut aec_q: VecDeque<f32> = VecDeque::with_capacity(32768);
             macro_rules! mic_stream { ($t:ty) => {
                 input.build_input_stream(&in_cfg, move |data: &[$t], _: &cpal::InputCallbackInfo| {
                     let (rv, ec) = (params.reverb.get(), params.echo.get());
@@ -179,25 +230,20 @@ impl Engine {
                     mono.clear();
                     let gain = params.mic_gain.get();
                     mono_frames(data, ch, |s| mono.push(dsp::soft_clip(s * gain)));
-                    let mut r = rings.lock().unwrap();
-                    for &s in &mono { push_capped(&mut r.mic_raw, s, 16384); }
-                    let mut refq = std::mem::take(&mut r.aec_ref);
+                    for &s in &mono { put(&mut mic_tx.mic_raw, s); }
+                    drain_into(&mut aec_rx, &mut aec_q, 24000);
                     cleaned.clear();
-                    cleaner.process(&mono, &mut refq, use_aec, use_nr, &mut |s| cleaned.push(s));
-                    r.aec_ref = refq;
+                    cleaner.process(&mono, &mut aec_q, use_aec, use_nr, &mut |s| cleaned.push(s));
                     let at = params.autotune.load(Ordering::Relaxed);
                     for &s in &cleaned {
                         // the judge listens to the voice as it is; auto-tune only colours what you hear
-                        push_capped(&mut r.mic_an, s, 16384);
+                        put(&mut mic_tx.mic_an, s);
                         let (l, rr) = fx.process(tune.process(s, at), rv, ec);
                         rs.push([l, rr], &mut |z| {
-                            if r.mon_out.len() >= cap_play { r.mon_out.pop_front(); }
-                            r.mon_out.push_back(z);
-                            if recording { push_capped(&mut r.rec_voice, (z[0] + z[1]) * 0.5, cap_rec); }
+                            put(&mut mon_tx, z);
+                            if recording { put(&mut mic_tx.rec_voice, (z[0] + z[1]) * 0.5); }
                         });
                     }
-                    // keep monitor latency low (device clocks drift)
-                    if r.mon_out.len() > max_lat { let n = r.mon_out.len() - tgt_lat; r.mon_out.drain(..n); }
                 }, err, None)
             }}
             let s = match in_sup.sample_format() {
@@ -212,17 +258,20 @@ impl Engine {
 
         /* --- speakers (voice monitor) --- */
         {
-            let rings = rings.clone();
             let params = params.clone();
             let ch = out_cfg.channels as usize;
             let mut g = 0f32;
+            let max_lat = (out_sr as f32 * 0.045) as usize;
+            let tgt_lat = (out_sr as f32 * 0.015) as usize;
             macro_rules! out_stream { ($t:ty) => {
                 output.build_output_stream(&out_cfg, move |data: &mut [$t], _: &cpal::OutputCallbackInfo| {
                     let tgt = params.mon_eff.get();
-                    let mut r = rings.lock().unwrap();
+                    // keep the monitor latency low (the two devices' clocks drift apart)
+                    let have = mon_rx.slots();
+                    if have > max_lat { if let Ok(c) = mon_rx.read_chunk(have - tgt_lat) { c.commit_all(); } }
                     for fr in data.chunks_mut(ch.max(1)) {
                         g += (tgt - g) * 0.002;
-                        let z = r.mon_out.pop_front().unwrap_or([0.0; 2]);
+                        let z = mon_rx.pop().unwrap_or([0.0; 2]);
                         let (l, rr) = (dsp::soft_clip(z[0] * g), dsp::soft_clip(z[1] * g));
                         let m = (l + rr) * 0.5;
                         match fr.len() {
@@ -231,7 +280,7 @@ impl Engine {
                                 *o = <$t>::from_sample(match i { 0 => l, 1 => rr, _ => m });
                             },
                         }
-                        push_capped(&mut r.mon_an, m, 16384);
+                        put(&mut out_tx.mon_an, m);
                     }
                 }, err, None)
             }}
@@ -248,19 +297,16 @@ impl Engine {
         /* --- system loopback (what the speakers play: YouTube + our voice) --- */
         let mut loopback_ok = false;
         {
-            let rings = rings.clone();
             let rec = recording.clone();
             let ch = out_cfg.channels as usize;
-            let cap_rec = out_sr as usize * 10;
             macro_rules! loop_stream { ($t:ty) => {
                 output.build_input_stream(&out_cfg, move |data: &[$t], _: &cpal::InputCallbackInfo| {
                     let recording = rec.load(Ordering::Relaxed);
-                    let mut r = rings.lock().unwrap();
-                    r.last_loop = Some(Instant::now());
+                    loop_tx.touch();
                     mono_frames(data, ch, |s| {
-                        push_capped(&mut r.loop_an, s, 16384);
-                        push_capped(&mut r.aec_ref, s, 24000);
-                        if recording { push_capped(&mut r.rec_loop, s, cap_rec); }
+                        put(&mut loop_tx.loop_an, s);
+                        put(&mut aec_tx, s);
+                        if recording { put(&mut loop_tx.rec_loop, s); }
                     });
                 }, err, None)
             }}
@@ -280,11 +326,12 @@ impl Engine {
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let worker = {
-            let (status, stop, rings, params, rec) = (status.clone(), stop.clone(), rings.clone(), params.clone(), recording.clone());
+            let (status, stop, params, rec) = (status.clone(), stop.clone(), params.clone(), recording.clone());
             let speakers = cfg.speakers_mode;
             let auto = cfg.auto;
             let dir = cfg.record_dir.clone();
-            std::thread::spawn(move || analysis(rings, params, status, stop, rec, in_sr, out_sr, speakers, loopback_ok, auto, dir))
+            let latency = cfg.latency;
+            std::thread::spawn(move || analysis(lanes, params, status, stop, rec, in_sr, out_sr, speakers, loopback_ok, auto, dir, latency))
         };
         Ok(Engine { _streams: streams, stop, worker: Some(worker), status })
     }
@@ -417,8 +464,19 @@ pub fn save_clip(src: &std::path::Path, from: f32, secs: f32, dst: &std::path::P
 
 /* ---------- simple recorders (mini-game) ---------- */
 
-/// Records the microphone on demand.
-pub struct Recorder { _stream: cpal::Stream, buf: Arc<Mutex<Vec<f32>>>, on: Arc<AtomicBool>, level: Arc<AtomicF32>, pub sr: u32 }
+/// Records the microphone on demand. The callback only writes into a lock-free lane; a helper
+/// thread (and `end`) move the samples on into the take.
+pub struct Recorder { _stream: cpal::Stream, take: Arc<Mutex<(Rx<f32>, Vec<f32>)>>, on: Arc<AtomicBool>, level: Arc<AtomicF32>, stop: Arc<AtomicBool>, max: usize, pub sr: u32 }
+impl Drop for Recorder { fn drop(&mut self) { self.stop.store(true, Ordering::Relaxed); } }
+/// Move what the lane holds into the take (up to `max` samples).
+fn pump(t: &mut (Rx<f32>, Vec<f32>), max: usize) {
+    let (rx, v) = t;
+    if let Ok(ch) = rx.read_chunk(rx.slots()) {
+        let (a, b) = ch.as_slices();
+        for x in a.iter().chain(b) { if v.len() < max { v.push(*x); } }
+        ch.commit_all();
+    }
+}
 impl Recorder {
     /// Microphone (with the user's mic gain).
     pub fn mic(name: &Option<String>, params: Arc<Params>) -> Result<Recorder, String> {
@@ -432,22 +490,25 @@ impl Recorder {
         let sr = cfg.sample_rate.0;
         let ch = cfg.channels as usize;
         let max = sr as usize * 30;
-        let buf = Arc::new(Mutex::new(Vec::<f32>::new()));
+        let (tx, rx) = rtrb::RingBuffer::<f32>::new(sr as usize * 2);
+        let mut tx = Some(tx);
+        let take = Arc::new(Mutex::new((rx, Vec::<f32>::new())));
         let on = Arc::new(AtomicBool::new(false));
         let level = Arc::new(AtomicF32::new(0.0));
+        let stop = Arc::new(AtomicBool::new(false));
         let err = |e: cpal::StreamError| eprintln!("recorder: {e}");
         macro_rules! st { ($t:ty) => {{
-            let (buf, on, level, params) = (buf.clone(), on.clone(), level.clone(), params.clone());
+            let (on, level, params) = (on.clone(), level.clone(), params.clone());
+            let mut tx = tx.take().expect("one stream");
             let mut held = 0f32;
             dev.build_input_stream(&cfg, move |data: &[$t], _: &cpal::InputCallbackInfo| {
                 let g = params.as_ref().map(|p| p.mic_gain.get()).unwrap_or(1.0);
                 let rec = on.load(Ordering::Relaxed);
                 let (mut s, mut n) = (0f32, 0usize);
-                let mut b = if rec { buf.lock().ok() } else { None };
                 mono_frames(data, ch, |x| {
                     let y = x * g;
                     s += y * y; n += 1;
-                    if let Some(b) = b.as_mut() { if b.len() < max { b.push(y); } }
+                    if rec { put(&mut tx, y); }
                 });
                 let r = if n > 0 { (s / n as f32).sqrt() } else { 0.0 };
                 held = (held * 0.85).max(r);
@@ -462,10 +523,27 @@ impl Recorder {
             f => return Err(format!("Формат не поддерживается: {f:?}")),
         }.map_err(|e| format!("Не удалось начать запись: {e}"))?;
         stream.play().map_err(|e| format!("Не удалось начать запись: {e}"))?;
-        Ok(Recorder { _stream: stream, buf, on, level, sr })
+        {
+            let (take, stop) = (take.clone(), stop.clone());
+            std::thread::spawn(move || while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(30));
+                if let Ok(mut t) = take.lock() { pump(&mut t, max); }
+            });
+        }
+        Ok(Recorder { _stream: stream, take, on, level, stop, max, sr })
     }
-    pub fn begin(&self) { if let Ok(mut b) = self.buf.lock() { b.clear(); } self.on.store(true, Ordering::Relaxed); }
-    pub fn end(&self) -> Vec<f32> { self.on.store(false, Ordering::Relaxed); self.buf.lock().map(|mut b| std::mem::take(&mut *b)).unwrap_or_default() }
+    pub fn begin(&self) {
+        if let Ok(mut t) = self.take.lock() {
+            // what was left over from before is thrown away
+            pump(&mut t, 0);
+            t.1.clear();
+        }
+        self.on.store(true, Ordering::Relaxed);
+    }
+    pub fn end(&self) -> Vec<f32> {
+        self.on.store(false, Ordering::Relaxed);
+        self.take.lock().map(|mut t| { pump(&mut t, self.max); std::mem::take(&mut t.1) }).unwrap_or_default()
+    }
     pub fn level(&self) -> f32 { self.level.get() }
 }
 
@@ -481,13 +559,15 @@ impl PitchMonitor {
         let cfg: cpal::StreamConfig = sup.config();
         let sr = cfg.sample_rate.0;
         let ch = cfg.channels as usize;
-        let buf = Arc::new(Mutex::new(VecDeque::<f32>::with_capacity(8192)));
+        let (tx, mut rx) = rtrb::RingBuffer::<f32>::new(1 << 15);
+        let mut tx = Some(tx);
         let err = |e: cpal::StreamError| eprintln!("pitch monitor: {e}");
         macro_rules! st { ($t:ty) => {{
-            let (buf, params) = (buf.clone(), params.clone());
+            let params = params.clone();
+            let mut tx = tx.take().expect("one stream");
             dev.build_input_stream(&cfg, move |data: &[$t], _: &cpal::InputCallbackInfo| {
                 let g = params.mic_gain.get();
-                if let Ok(mut b) = buf.lock() { mono_frames(data, ch, |x| push_capped(&mut b, x * g, 8192)); }
+                mono_frames(data, ch, |x| put(&mut tx, x * g));
             }, err, None)
         }}}
         let stream = match sup.sample_format() {
@@ -500,11 +580,14 @@ impl PitchMonitor {
         stream.play().map_err(|e| format!("Не удалось запустить микрофон: {e}"))?;
         let (midi, level, stop) = (Arc::new(AtomicF32::new(0.0)), Arc::new(AtomicF32::new(0.0)), Arc::new(AtomicBool::new(false)));
         {
-            let (buf, midi, level, stop) = (buf.clone(), midi.clone(), level.clone(), stop.clone());
+            let (midi, level, stop) = (midi.clone(), level.clone(), stop.clone());
             std::thread::spawn(move || {
+                let mut buf = VecDeque::<f32>::with_capacity(8192);
                 while !stop.load(Ordering::Relaxed) {
                     std::thread::sleep(Duration::from_millis(25));
-                    let v: Vec<f32> = match buf.lock() { Ok(b) if b.len() >= 2048 => b.iter().rev().take(2048).rev().copied().collect(), _ => continue };
+                    drain_into(&mut rx, &mut buf, 8192);
+                    if buf.len() < 2048 { continue; }
+                    let v: Vec<f32> = buf.iter().rev().take(2048).rev().copied().collect();
                     level.set(dsp::rms(&v));
                     midi.set(dsp::pitch(&v, sr as f32, 0.85).filter(|(f, _)| *f > 60.0 && *f < 1300.0).map(|(f, _)| dsp::to_midi(f)).unwrap_or(0.0));
                 }
@@ -578,9 +661,13 @@ fn take_into(src: &mut VecDeque<f32>, dst: &mut VecDeque<f32>, cap: usize) -> us
 
 #[allow(clippy::too_many_arguments)]
 fn analysis(
-    rings: Arc<Mutex<Rings>>, params: Arc<Params>, status: Arc<Mutex<Status>>, stop: Arc<AtomicBool>,
+    mut lanes: Lanes, params: Arc<Params>, status: Arc<Mutex<Status>>, stop: Arc<AtomicBool>,
     recording: Arc<AtomicBool>, in_sr: u32, out_sr: u32, speakers: bool, loopback_ok: bool, auto: bool, dir: PathBuf,
+    latency: f32,
 ) -> Outcome {
+    let mut ring = Rings::default();
+    // the voice comes back `latency` after the music it answers: the music in the recording waits for it
+    ring.rec_loop.extend(std::iter::repeat_n(0.0, (latency.clamp(0.0, 1.0) * out_sr as f32) as usize));
     let cal_secs = if speakers { 4.0 } else { 1.5 };
     let hop = (in_sr as usize / 47).max(256); // ~21 ms
     let edges = dsp::band_edges_hz();
@@ -639,13 +726,14 @@ fn analysis(
         std::thread::sleep(Duration::from_millis(8));
         let mut toast = None;
         {
-            let mut r = rings.lock().unwrap();
+            lanes.fill(&mut ring);
+            let r = &mut ring;
             new_mic += take_into(&mut r.mic_an, &mut mic, FFT_N);
             take_into(&mut r.mic_raw, &mut raw, FFT_N);
             take_into(&mut r.mon_an, &mut mon, FFT_N);
             let stale = r.last_loop.map(|t| t.elapsed() > Duration::from_millis(150)).unwrap_or(true);
             if stale { r.loop_an.clear(); lp.clear(); } else { take_into(&mut r.loop_an, &mut lp, FFT_N); }
-            tick_rec(&mut r, false, &mut writer);
+            tick_rec(r, false, &mut writer);
         }
         if new_mic < hop || mic.len() < 2048 { continue; }
         let dt = new_mic as f32 / in_sr as f32;
@@ -817,10 +905,8 @@ fn analysis(
 
     params.mon_eff.set(0.0);
     recording.store(false, Ordering::Relaxed);
-    {
-        let mut r = rings.lock().unwrap();
-        tick_rec(&mut r, true, &mut writer);
-    }
+    lanes.fill(&mut ring);
+    tick_rec(&mut ring, true, &mut writer);
     let mut rec_out = None;
     if let Some(w) = writer.take() {
         let _ = w.finalize();
@@ -869,15 +955,15 @@ mod tests {
     /// voice: None = silent, Some((detune_cents, out_of_key))
     fn sim(voice: Option<(f32, bool)>, speakers: bool) -> u32 { sim_ex(voice, speakers, false) }
     fn sim_ex(voice: Option<(f32, bool)>, speakers: bool, aec: bool) -> u32 {
-        let rings = Arc::new(Mutex::new(Rings::default()));
         let params = Arc::new(Params::default());
         let status = Arc::new(Mutex::new(Status::default()));
         let stop = Arc::new(AtomicBool::new(false));
         let rec = Arc::new(AtomicBool::new(true));
         let dir = std::env::temp_dir().join(format!("kt_{}", rand_id()));
         let sr = 48000u32;
-        let w = { let (r, p, s, st, rc, d) = (rings.clone(), params.clone(), status.clone(), stop.clone(), rec.clone(), dir.clone());
-            std::thread::spawn(move || analysis(r, p, s, st, rc, sr, sr, speakers, true, false, d)) };
+        let (mut mtx, _otx, mut ltx, lanes) = lanes(sr);
+        let w = { let (p, s, st, rc, d) = (params.clone(), status.clone(), stop.clone(), rec.clone(), dir.clone());
+            std::thread::spawn(move || analysis(lanes, p, s, st, rc, sr, sr, speakers, true, false, d, 0.0)) };
         let chords: [[f32; 3]; 4] = [[60., 64., 67.], [57., 60., 64.], [53., 57., 60.], [55., 59., 62.]];
         let hz = |m: f32| 440.0 * 2f32.powf((m - 69.0) / 12.0);
         let start = Instant::now();
@@ -890,7 +976,6 @@ mod tests {
         while start.elapsed().as_secs_f32() < 13.0 {
             std::thread::sleep(Duration::from_millis(10));
             let target = (start.elapsed().as_secs_f64() * sr as f64) as u64;
-            let mut r = rings.lock().unwrap();
             while n < target {
                 let t = n as f32 / sr as f32;
                 let ch = chords[((t / 2.0) as usize) % 4];
@@ -914,17 +999,17 @@ mod tests {
                 let bleed = delay.pop_front().unwrap();
                 let mic = if speakers { 0.35 * bleed } else { 0.0 } + v + noise;
                 pend.push(mic);
-                push_capped(&mut r.mic_raw, mic, 16384);
+                put(&mut mtx.mic_raw, mic);
                 refq.push_back(music);
-                push_capped(&mut r.loop_an, music, 16384);
-                r.rec_voice.push_back(v); r.rec_loop.push_back(music);
+                put(&mut ltx.loop_an, music);
+                put(&mut mtx.rec_voice, v); put(&mut ltx.rec_loop, music);
                 n += 1;
             }
             let mut outv = Vec::new();
             cleaner.process(&pend, &mut refq, aec, false, &mut |x| outv.push(x));
             pend.clear();
-            for x in outv { push_capped(&mut r.mic_an, x, 16384); }
-            r.last_loop = Some(Instant::now());
+            for x in outv { put(&mut mtx.mic_an, x); }
+            ltx.touch();
         }
         stop.store(true, Ordering::Relaxed);
         let out = w.join().unwrap();
@@ -935,15 +1020,15 @@ mod tests {
 
     #[test]
     fn auto_start_stop() {
-        let rings = Arc::new(Mutex::new(Rings::default()));
         let params = Arc::new(Params::default());
         let status = Arc::new(Mutex::new(Status::default()));
         let stop = Arc::new(AtomicBool::new(false));
         let rec = Arc::new(AtomicBool::new(true));
         let dir = std::env::temp_dir().join(format!("kt_{}", rand_id()));
         let sr = 48000u32;
-        let w = { let (r, p, s, st, rc, d) = (rings.clone(), params.clone(), status.clone(), stop.clone(), rec.clone(), dir.clone());
-            std::thread::spawn(move || analysis(r, p, s, st, rc, sr, sr, true, true, true, d)) };
+        let (mut mtx, _otx, mut ltx, lanes) = lanes(sr);
+        let w = { let (p, s, st, rc, d) = (params.clone(), status.clone(), stop.clone(), rec.clone(), dir.clone());
+            std::thread::spawn(move || analysis(lanes, p, s, st, rc, sr, sr, true, true, true, d, 0.0)) };
         let hz = |m: f32| 440.0 * 2f32.powf((m - 69.0) / 12.0);
         let start = Instant::now();
         let (mut n, mut ph, mut pv) = (0u64, 0f32, 0f32);
@@ -954,19 +1039,17 @@ mod tests {
             let el = start.elapsed().as_secs_f32();
             let target = (start.elapsed().as_secs_f64() * sr as f64) as u64;
             let music_playing = el > 1.5 && el < 22.0;
-            let mut r = rings.lock().unwrap();
             while n < target {
                 let t = n as f32 / sr as f32;
                 let mut m = 0.0;
                 if music_playing { ph += hz(60.0) / sr as f32; for h in 1..4 { m += (6.2832 * ph * h as f32).sin() * 0.1 / h as f32; } }
                 let mut v = 0.0;
                 if t > 8.0 && t < 20.0 { pv += hz(72.0) / sr as f32; for h in 1..6 { v += (6.2832 * pv * h as f32).sin() * 0.2 / h as f32; } }
-                push_capped(&mut r.mic_an, 0.3 * m + v, 16384);
-                if music_playing { push_capped(&mut r.loop_an, m, 16384); }
+                put(&mut mtx.mic_an, 0.3 * m + v);
+                if music_playing { put(&mut ltx.loop_an, m); }
                 n += 1;
             }
-            if music_playing { r.last_loop = Some(Instant::now()); }
-            drop(r);
+            if music_playing { ltx.touch(); }
             let s = status.lock().unwrap().clone();
             let ph_name = match s.phase { Phase::Waiting => "wait", Phase::Calibrating => "cal", Phase::Singing => "sing" };
             if log.last().map(|(p, _): &(&str, f32)| *p != ph_name).unwrap_or(true) { log.push((ph_name, el)); }
@@ -1000,6 +1083,26 @@ mod tests {
 
 #[cfg(test)]
 mod window_tests {
+    #[test]
+    fn measures_the_delay_of_the_answers() {
+        let sr = 48000u32;
+        let mic_t0 = 0.37; // the microphone started a bit after the clicks' clock
+        let clicks: Vec<f64> = (0..10).map(|k| 2.3 + k as f64 * 0.75).collect();
+        let mut mic = vec![0f32; sr as usize * 12];
+        let mut seed = 7u32;
+        for x in mic.iter_mut() { seed = seed.wrapping_mul(1664525).wrapping_add(1013904223); *x = (seed as f32 / u32::MAX as f32 - 0.5) * 0.002; }
+        // «та» 180 ms after each click (± a little, like a person), 80 ms of voice
+        for (k, &c) in clicks.iter().enumerate() {
+            let jitter = [0.0, 0.012, -0.01, 0.006, -0.004, 0.015, -0.012, 0.0, 0.008, -0.006][k];
+            let s = ((c + 0.18 + jitter - mic_t0) * sr as f64) as usize;
+            for i in 0..(sr as usize * 8 / 100) { mic[s + i] += (i as f32 * 0.04).sin() * 0.3; }
+        }
+        let l = crate::audio::estimate_latency(&mic, sr, mic_t0, &clicks).unwrap();
+        assert!((l - 0.18).abs() < 0.012, "{l}");
+        // silence → a clear error, not a number
+        assert!(crate::audio::estimate_latency(&vec![0.0; sr as usize * 12], sr, mic_t0, &clicks).is_err());
+    }
+
     #[test]
     fn best_window_finds_peak() {
         let mut b = vec![0.1f32; 600];
@@ -1082,4 +1185,179 @@ mod file_tests {
         assert_eq!(r.len(), s.len());
         assert!((r[100] - s[100]).abs() < 0.001);
     }
+}
+
+/* ---------- latency test ---------- */
+
+/// How late the voice comes back: the program clicks a steady beat, the singer says «та» on
+/// every click, and the delay from a click leaving the program to the «та» arriving from the
+/// microphone is measured (speakers or headphones, Bluetooth included). It is the same delay
+/// that sits between the music and the voice in a recording.
+pub struct LatencyTest {
+    _streams: Vec<cpal::Stream>,
+    beat: Arc<AtomicU32>,
+    result: Arc<Mutex<Option<Result<f32, String>>>>,
+}
+
+/// Clicks: the first `LT_LEAD` only count in.
+pub const LT_CLICKS: u32 = 12;
+pub const LT_LEAD: u32 = 2;
+const LT_PERIOD: f64 = 0.75;
+const LT_FIRST: f64 = 0.8;
+
+impl LatencyTest {
+    pub fn start(input_name: &Option<String>, params: Arc<Params>) -> Result<LatencyTest, String> {
+        let host = cpal::default_host();
+        let input = find(host.input_devices(), input_name).or_else(|| host.default_input_device()).ok_or("Микрофон не найден")?;
+        let output = host.default_output_device().ok_or("Устройство вывода звука не найдено")?;
+        let in_sup = input.default_input_config().map_err(|e| format!("Микрофон: {e}"))?;
+        let out_sup = output.default_output_config().map_err(|e| format!("Вывод: {e}"))?;
+        let (in_cfg, out_cfg): (cpal::StreamConfig, cpal::StreamConfig) = (in_sup.config(), out_sup.config());
+        let (in_sr, out_sr) = (in_cfg.sample_rate.0, out_cfg.sample_rate.0);
+        let base = Instant::now();
+        let us = move |t: Instant| t.saturating_duration_since(base).as_micros() as u64;
+        let err = |e: cpal::StreamError| eprintln!("latency test: {e}");
+        let beat = Arc::new(AtomicU32::new(0));
+        // the moments the clicks left the program; the microphone with the time of each block's end
+        let (click_tx, mut click_rx) = rtrb::RingBuffer::<u64>::new(64);
+        let (mic_tx, mut mic_rx) = rtrb::RingBuffer::<f32>::new(in_sr as usize * 4);
+        let (blk_tx, mut blk_rx) = rtrb::RingBuffer::<(u64, u32)>::new(4096);
+        let (mut click_tx, mut mic_tx, mut blk_tx) = (Some(click_tx), Some(mic_tx), Some(blk_tx));
+
+        let click = click_sound(out_sr);
+        let mut streams = Vec::new();
+        {
+            let ch = out_cfg.channels as usize;
+            let period = (LT_PERIOD * out_sr as f64) as u64;
+            let first = (LT_FIRST * out_sr as f64) as u64;
+            let beat = beat.clone();
+            macro_rules! out_stream { ($t:ty) => {{
+                let mut tx = click_tx.take().expect("one stream");
+                let click = click.clone();
+                let beat = beat.clone();
+                let mut f: u64 = 0;
+                output.build_output_stream(&out_cfg, move |data: &mut [$t], _: &cpal::OutputCallbackInfo| {
+                    let now = Instant::now();
+                    for (k, fr) in data.chunks_mut(ch.max(1)).enumerate() {
+                        let mut v = 0.0;
+                        if f >= first {
+                            let (n, pos) = ((f - first) / period, ((f - first) % period) as usize);
+                            if n < LT_CLICKS as u64 {
+                                if pos == 0 {
+                                    put(&mut tx, us(now) + (k as u64 * 1_000_000 / out_sr as u64));
+                                    beat.store(n as u32 + 1, Ordering::Relaxed);
+                                }
+                                // count-in clicks are lower
+                                v = click.get(pos).copied().unwrap_or(0.0) * if n < LT_LEAD as u64 { 0.6 } else { 1.0 };
+                            }
+                        }
+                        for o in fr.iter_mut() { *o = <$t>::from_sample(v); }
+                        f += 1;
+                    }
+                }, err, None)
+            }}}
+            let s = match out_sup.sample_format() {
+                cpal::SampleFormat::F32 => out_stream!(f32),
+                cpal::SampleFormat::I16 => out_stream!(i16),
+                cpal::SampleFormat::U16 => out_stream!(u16),
+                cpal::SampleFormat::I32 => out_stream!(i32),
+                f => return Err(format!("Формат вывода не поддерживается: {f:?}")),
+            }.map_err(|e| format!("Не удалось открыть вывод звука: {e}"))?;
+            streams.push(s);
+        }
+        {
+            let ch = in_cfg.channels as usize;
+            macro_rules! in_stream { ($t:ty) => {{
+                let (mut tx, mut btx) = (mic_tx.take().expect("one stream"), blk_tx.take().expect("one stream"));
+                let params = params.clone();
+                input.build_input_stream(&in_cfg, move |data: &[$t], _: &cpal::InputCallbackInfo| {
+                    let now = us(Instant::now());
+                    let g = params.mic_gain.get();
+                    let mut n = 0u32;
+                    mono_frames(data, ch, |x| { put(&mut tx, x * g); n += 1; });
+                    put(&mut btx, (now, n));
+                }, err, None)
+            }}}
+            let s = match in_sup.sample_format() {
+                cpal::SampleFormat::F32 => in_stream!(f32),
+                cpal::SampleFormat::I16 => in_stream!(i16),
+                cpal::SampleFormat::U16 => in_stream!(u16),
+                cpal::SampleFormat::I32 => in_stream!(i32),
+                f => return Err(format!("Формат микрофона не поддерживается: {f:?}")),
+            }.map_err(|e| format!("Не удалось открыть микрофон: {e}"))?;
+            streams.push(s);
+        }
+        for s in &streams { s.play().map_err(|e| format!("Не удалось запустить звук: {e}"))?; }
+
+        let result = Arc::new(Mutex::new(None));
+        {
+            let result = result.clone();
+            std::thread::spawn(move || {
+                let total = LT_FIRST + LT_PERIOD * LT_CLICKS as f64 + 0.8;
+                let (mut mic, mut blocks, mut clicks) = (Vec::<f32>::new(), Vec::<(u64, u32)>::new(), Vec::<u64>::new());
+                let t0 = Instant::now();
+                while t0.elapsed().as_secs_f64() < total + 1.0 {
+                    std::thread::sleep(Duration::from_millis(20));
+                    while let Ok(x) = mic_rx.pop() { mic.push(x); }
+                    while let Ok(b) = blk_rx.pop() { blocks.push(b); }
+                    while let Ok(c) = click_rx.pop() { clicks.push(c); }
+                }
+                // when the microphone's first sample was heard: each block ends "now"
+                let mut seen = 0u64;
+                let mut starts: Vec<f64> = blocks.iter().map(|&(t, n)| { seen += n as u64; t as f64 / 1e6 - seen as f64 / in_sr as f64 }).collect();
+                let r = if starts.is_empty() || clicks.len() < LT_CLICKS as usize {
+                    Err("Звук не пошёл — проверьте колонки или наушники".to_string())
+                } else {
+                    starts.sort_by(|a, b| a.total_cmp(b));
+                    let mic_t0 = starts[starts.len() / 2];
+                    let cl: Vec<f64> = clicks.iter().map(|&c| c as f64 / 1e6).collect();
+                    estimate_latency(&mic, in_sr, mic_t0, &cl[LT_LEAD as usize..])
+                };
+                if let Ok(mut s) = result.lock() { *s = Some(r); }
+            });
+        }
+        Ok(LatencyTest { _streams: streams, beat, result })
+    }
+    /// The click being played now (1..=LT_CLICKS; 0 — not yet).
+    pub fn beat(&self) -> u32 { self.beat.load(Ordering::Relaxed) }
+    /// Seconds, once the test is over.
+    pub fn result(&self) -> Option<Result<f32, String>> { self.result.lock().ok().and_then(|r| r.clone()) }
+}
+
+/// A short wooden click.
+fn click_sound(sr: u32) -> Vec<f32> {
+    let n = (sr as f32 * 0.04) as usize;
+    (0..n).map(|i| {
+        let t = i as f32 / sr as f32;
+        ((2.0 * std::f32::consts::PI * 1600.0 * t).sin() * 0.7 + (2.0 * std::f32::consts::PI * 2900.0 * t).sin() * 0.3) * (-t * 90.0).exp() * 0.8
+    }).collect()
+}
+
+/// The delay from each click (`clicks`, seconds) to the sound that answers it in `mic` (whose
+/// first sample was heard at `mic_t0`). The median of the clicks that got an answer.
+pub fn estimate_latency(mic: &[f32], sr: u32, mic_t0: f64, clicks: &[f64]) -> Result<f32, String> {
+    let hop = (sr / 200).max(1) as usize; // 5 ms
+    let env: Vec<f32> = mic.chunks(hop).map(|c| 10.0 * (c.iter().map(|x| x * x).sum::<f32>() / c.len() as f32 + 1e-12).log10()).collect();
+    if env.is_empty() { return Err("Микрофон молчит".into()); }
+    let at = |t: f64| (((t - mic_t0) * sr as f64) / hop as f64).round() as i64;
+    let mut sorted = env.clone();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let floor = sorted[sorted.len() / 5];
+    let mut lat = Vec::new();
+    for &c in clicks {
+        let (a, b) = (at(c - 0.12).max(0) as usize, (at(c + 0.6).max(0) as usize).min(env.len()));
+        if b <= a + 4 { continue; }
+        let w = &env[a..b];
+        let top = w.iter().cloned().fold(f32::MIN, f32::max);
+        if top < floor + 15.0 { continue; } // nothing said on this click
+        // the onset: where the sound first gets within 10 dB of its peak
+        let k = w.iter().position(|&e| e > top - 10.0).unwrap_or(0);
+        lat.push(((a + k) as f64 * hop as f64 / sr as f64 + mic_t0 - c) as f32);
+    }
+    if lat.len() < 5 { return Err("Не расслышал — говорите «та» громче и точно со щелчками".into()); }
+    lat.sort_by(|a, b| a.total_cmp(b));
+    let med = lat[lat.len() / 2];
+    let spread = lat[lat.len() * 3 / 4] - lat[lat.len() / 4];
+    if spread > 0.08 { return Err("Получилось неровно — попробуйте ещё раз, точно в такт".into()); }
+    Ok(med.clamp(0.0, 0.8))
 }
