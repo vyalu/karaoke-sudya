@@ -200,27 +200,51 @@ pub fn file_url(p: &Path) -> String {
 
 fn lines_path(scene: &Path) -> PathBuf { scene.with_extension(format!("{}.lines", scene.extension().and_then(|e| e.to_str()).unwrap_or(""))) }
 
-pub fn save_lines(scene: &Path, lines: &[Line]) {
-    let t: String = lines.iter().map(|l| {
-        let txt = l.text.replace(['\t', '\n', '\r'], " ");
-        if txt.trim().is_empty() { format!("{:.2}\t{:.2}\n", l.start, l.end) } else { format!("{:.2}\t{:.2}\t{}\n", l.start, l.end, txt.trim()) }
-    }).collect();
+/// Save the moments, keeping the clip's «импровизация» mark as it was.
+pub fn save_lines(scene: &Path, lines: &[Line]) { save_lines_as(scene, lines, is_improv(scene)); }
+
+/// Save the moments: `начало⇥конец[⇥текст[⇥персонаж]]` per line; `#improv` marks an improvisation clip.
+pub fn save_lines_as(scene: &Path, lines: &[Line], improv: bool) {
+    let clean = |x: &str| x.replace(['\t', '\n', '\r'], " ").trim().to_string();
+    let mut t = String::new();
+    if improv { t.push_str(IMPROV_MARK); t.push('\n'); }
+    for l in lines {
+        let (txt, role) = (clean(&l.text), clean(&l.role));
+        t.push_str(&match (txt.is_empty(), role.is_empty()) {
+            (true, true) => format!("{:.2}\t{:.2}\n", l.start, l.end),
+            (_, true) => format!("{:.2}\t{:.2}\t{txt}\n", l.start, l.end),
+            _ => format!("{:.2}\t{:.2}\t{txt}\t{role}\n", l.start, l.end),
+        });
+    }
     let _ = std::fs::write(lines_path(scene), t);
+}
+
+const IMPROV_MARK: &str = "#improv";
+/// The clip is for improvisation: players make up their own words.
+pub fn is_improv(scene: &Path) -> bool {
+    std::fs::read_to_string(lines_path(scene)).map(|t| t.lines().any(|l| l.trim() == IMPROV_MARK)).unwrap_or(false)
+}
+
+/// Equal parts of about `len` seconds over the whole clip (improvisation without words to follow).
+pub fn even_parts(dur: f32, len: f32) -> Vec<Line> {
+    let n = (dur / len).round().max(1.0) as usize;
+    let w = dur / n as f32;
+    (0..n).map(|k| Line::new(k as f32 * w + 0.05, ((k + 1) as f32 * w - 0.15).min(dur))).filter(|l| l.end - l.start > 0.5).collect()
 }
 /// Moments from the text of a .lines file (tabs or spaces, dot or comma decimals); a third
 /// tab column is the phrase's text. Subtitles (.srt / .vtt text) are understood as well.
 pub fn parse_lines(t: &str) -> Option<Vec<Line>> {
     if t.contains("-->") {
-        let v: Vec<Line> = crate::subtitles::parse_subtitles(t).into_iter().map(|p| Line { start: p.start, end: p.end, text: p.text }).collect();
+        let v: Vec<Line> = crate::subtitles::parse_subtitles(t).into_iter().map(|p| Line { start: p.start, end: p.end, text: p.text, ..Default::default() }).collect();
         return (!v.is_empty()).then_some(v);
     }
     let num = |s: &str| s.trim().replace(',', ".").parse::<f32>().ok();
     let mut v: Vec<Line> = t.lines().filter_map(|l| {
         let p: Vec<&str> = l.split(|c: char| c == '\t' || c == ' ' || c == ';').filter(|x| !x.is_empty()).collect();
         let (a, b) = (num(p.first()?)?, num(p.get(1)?)?);
-        // text: everything after the second tab, unless it is just numbers (old extra columns)
-        let text = l.splitn(3, '\t').nth(2).map(|x| x.trim().to_string()).filter(|x| !x.is_empty() && x.split_whitespace().any(|w| num(w).is_none())).unwrap_or_default();
-        (b > a).then_some(Line { start: a, end: b, text })
+        // text and character: the 3rd and 4th tab columns, unless they are just numbers (old extra columns)
+        let col = |k: usize| l.split('\t').nth(k).map(|x| x.trim().to_string()).filter(|x| !x.is_empty() && x.split_whitespace().any(|w| num(w).is_none())).unwrap_or_default();
+        (b > a).then_some(Line { start: a, end: b, text: col(2), role: col(3) })
     }).collect();
     v.sort_by(|a, b| a.start.total_cmp(&b.start));
     (!v.is_empty()).then_some(v)
@@ -247,7 +271,7 @@ pub fn move_moments(lines: &[Line], pieces: &[(f32, f32)]) -> Vec<Line> {
         let Some((k, _)) = best else { continue };
         let (a, b) = pieces[k];
         let (s, e) = (starts[k] + l.start.max(a) - a, starts[k] + l.end.min(b) - a);
-        if e - s >= 0.2 { out.push(Line { start: s, end: e, text: l.text.clone() }); }
+        if e - s >= 0.2 { out.push(Line { start: s, end: e, text: l.text.clone(), role: l.role.clone() }); }
     }
     out.sort_by(|x, y| x.start.total_cmp(&y.start));
     out
@@ -306,7 +330,7 @@ fn upgrade_old_trim(scene: &Path) {
     let a = t.split_whitespace().next().and_then(|x| x.replace(',', ".").parse::<f32>().ok()).unwrap_or(0.0);
     if a > 0.0 {
         if let Some(v) = find_lines(scene).and_then(|f| std::fs::read_to_string(f).ok()).and_then(|t| parse_lines(&t)) {
-            let shifted: Vec<Line> = v.into_iter().map(|l| Line { start: l.start + a, end: l.end + a, text: l.text }).collect();
+            let shifted: Vec<Line> = v.into_iter().map(|l| Line { start: l.start + a, end: l.end + a, ..l }).collect();
             save_lines(scene, &shifted);
         }
     }
@@ -319,16 +343,21 @@ fn upgrade_old_trim(scene: &Path) {
 pub struct Take { pub at: f32, pub samples: Vec<f32>, pub sr: u32 }
 
 #[derive(Clone, Default, PartialEq, Debug)]
-pub struct Line { pub start: f32, pub end: f32, /// what is said (from speech recognition or subtitles)
-    pub text: String }
-impl Line { pub fn new(start: f32, end: f32) -> Self { Line { start, end, text: String::new() } } }
+pub struct Line {
+    pub start: f32, pub end: f32,
+    /// what is said (subtitles or typed in the editor) — the prompter
+    pub text: String,
+    /// who says it: a character of the scene («Шрек»); "" — nobody in particular
+    pub role: String,
+}
+impl Line { pub fn new(start: f32, end: f32) -> Self { Line { start, end, ..Default::default() } } }
 
 #[derive(Clone, Copy)]
 enum Drag { Edge(usize, bool), New(f32, f32) }
 
 
 #[derive(Clone, Copy, PartialEq)]
-pub enum DPhase { Setup, Edit, Record, Final }
+pub enum DPhase { Setup, Edit, Cast, Record, Final }
 
 pub struct Dub {
     root: PathBuf,
@@ -354,6 +383,13 @@ pub struct Dub {
     orig: Vec<f32>, side: Vec<f32>, sr: u32,
     /// pull the original voices out during the lines (keeps music and effects)
     devoice: bool,
+    /// improvisation: there are no words to repeat, the players make up their own
+    improv: bool,
+    /// roles: who plays which character (None — the character keeps its original voice).
+    /// `None` here: one player dubs the whole clip
+    cast: Option<Vec<(String, Option<usize>)>>,
+    /// a new character being named in the editor
+    new_role: Option<String>,
     lines: Vec<Line>,
     cur: usize,
     pub mic: Option<audio::Recorder>,
@@ -429,6 +465,11 @@ impl Listen {
 }
 
 fn pcol(i: usize) -> Color32 { player_color(i) }
+/// A character's colour: by its place among the clip's characters.
+fn role_col(roles: &[String], r: &str) -> Color32 {
+    const C: [Color32; 6] = [Color32::from_rgb(255, 181, 71), Color32::from_rgb(86, 204, 242), Color32::from_rgb(178, 132, 255), Color32::from_rgb(98, 222, 140), Color32::from_rgb(255, 120, 160), Color32::from_rgb(240, 230, 110)];
+    roles.iter().position(|x| x == r).map(|k| C[k % C.len()]).unwrap_or(AMBER())
+}
 
 pub fn dub_root() -> PathBuf { user_dir("Озвучка") }
 
@@ -496,16 +537,38 @@ impl Dub {
     /// Somebody has already recorded something on this clip.
     fn any_takes(&self) -> bool { self.takes.iter().any(|v| v.iter().any(|t| t.is_some())) }
 
-    /// What plays under the players' voices.
+    /// What plays under the players' voices. Only the dubbed moments lose their voices: a character
+    /// nobody plays keeps the original. Improvisation keeps the sound as it is (or without voices,
+    /// when the neural net has taken them out).
     fn background(&self) -> Vec<f32> {
         if !self.devoice { return self.orig.clone(); }
-        let spans: Vec<(f32, f32)> = self.lines.iter().map(|l| (l.start, l.end)).collect();
+        if self.improv && self.clean.is_none() { return self.orig.clone(); }
+        let spans: Vec<(f32, f32)> = self.lines.iter().enumerate().filter(|(i, _)| self.owner(*i).is_some()).map(|(_, l)| (l.start, l.end)).collect();
         devoice(&self.orig, self.sr, &spans, self.clean.as_deref())
+    }
+    /// The characters of the clip, in order of appearance.
+    fn roles(&self) -> Vec<String> {
+        let mut v: Vec<String> = Vec::new();
+        for l in &self.lines { if !l.role.is_empty() && !v.contains(&l.role) { v.push(l.role.clone()); } }
+        v
+    }
+    /// Who dubs moment `i` (None — it stays as in the original).
+    fn owner(&self, i: usize) -> Option<usize> {
+        match &self.cast {
+            None => Some(self.who),
+            Some(c) => { let r = &self.lines.get(i)?.role; c.iter().find(|(n, _)| n == r).and_then(|(_, p)| *p) }
+        }
+    }
+    /// The take of moment `i` by whoever dubs it.
+    fn take_of(&self, i: usize) -> Option<&Take> { self.owner(i).and_then(|p| self.take(p, i)) }
+    /// «Шрек — Макс, Осёл — Слава».
+    fn cast_line(&self) -> String {
+        self.cast.as_ref().map(|c| c.iter().map(|(r, p)| format!("{r} — {}", p.and_then(|p| self.players.get(p).cloned()).unwrap_or_else(|| "оригинал".into()))).collect::<Vec<_>>().join(", ")).unwrap_or_default()
     }
     pub fn new() -> Self {
         let mut d = Self {
             root: dub_root(), scenes: vec![], status: Default::default(), cats: vec![], cat: None, new_cat: None, last_pick: None, phase: DPhase::Setup, players: vec![], takes: vec![], who: 0,
-            scene: None, video: false, orig: vec![], side: vec![], devoice: true, sr: 48000, lines: vec![], cur: 0, mic: None,
+            scene: None, video: false, orig: vec![], side: vec![], devoice: true, improv: false, cast: None, new_role: None, sr: 48000, lines: vec![], cur: 0, mic: None,
             rec_since: None, stop_at: None, show_since: None, bg: 0.8, last_scan: Instant::now(), loading: false, mon: None, live: vec![], refc: None, refenv: wave::Env::default(), live_lvl: vec![], intro: false, sel: None, view: (0.0, 0.0), cursor: 0.0, drag: None, export: None, sync_until: None, last_sync: Instant::now(), rec_bg: true, rec_ref: None, next_who: 0, listen: None, clean: None, cut_mode: false, lines_stash: vec![], preview: None, fullenv: wave::Env::default(), peak_max: 1.0, play_from: None,
         };
         d.scan();
@@ -524,23 +587,27 @@ impl Dub {
             let lp = lines_path(p);
             let st = match std::fs::read_to_string(&lp) {
                 Err(_) => "моменты найдутся сами",
-                Ok(t) if t.lines().any(|l| l.splitn(3, '\t').nth(2).is_some()) => "реплики с текстом",
-                Ok(_) => "моменты размечены",
+                Ok(t) if t.lines().any(|l| l.trim() == IMPROV_MARK) => "импровизация",
+                Ok(t) => {
+                    let v = parse_lines(&t).unwrap_or_default();
+                    if v.iter().any(|l| !l.role.is_empty()) { "по ролям" } else if v.iter().any(|l| !l.text.is_empty()) { "реплики с текстом" } else { "моменты размечены" }
+                }
             };
             let clean = if crate::separate::cache_path(p).exists() { " · голоса убраны" } else { "" };
-            (p.clone(), if clean.is_empty() { st } else { match st { "реплики с текстом" => "реплики с текстом · голоса убраны", "моменты размечены" => "моменты размечены · голоса убраны", _ => "голоса убраны" } })
+            (p.clone(), if clean.is_empty() { st } else { match st { "реплики с текстом" => "реплики с текстом · голоса убраны", "моменты размечены" => "моменты размечены · голоса убраны", "по ролям" => "по ролям · голоса убраны", "импровизация" => "импровизация · голоса убраны", _ => "голоса убраны" } })
         }).collect();
         self.scenes = v;
         self.last_scan = Instant::now();
     }
     fn resplit(&mut self) {
+        if self.improv { self.lines = even_parts(self.dur(), 6.0); self.save(); return; }
         self.lines = segment(&self.orig, self.sr, SENS).into_iter().map(|(a, b)| Line::new(a, b)).collect();
         self.save();
     }
     /// Save the moments (not in cut mode: then `lines` are the pieces of the cut).
     fn save(&self) {
         if self.cut_mode { return; }
-        if let Some(s) = &self.scene { save_lines(s, &self.lines); }
+        if let Some(s) = &self.scene { save_lines_as(s, &self.lines, self.improv); }
     }
     /// Where the preview of the cut is now: (time in the file, time in the result).
     fn preview_pos(&self) -> Option<(f32, f32)> {
@@ -568,22 +635,23 @@ impl Dub {
         let b = ((b * self.sr as f32) as usize).min(self.orig.len()).max(a);
         self.orig[a..b].to_vec()
     }
-    /// The next line without a take, starting after `from`.
+    /// The next line someone still has to dub, starting at `from`.
     fn next_open(&self, from: usize) -> usize {
-        (from..self.lines.len()).chain(0..from).find(|&i| self.take(self.who, i).is_none()).unwrap_or(self.lines.len())
+        (from..self.lines.len()).chain(0..from).find(|&i| self.owner(i).is_some() && self.take_of(i).is_none()).unwrap_or(self.lines.len())
     }
     fn take(&self, p: usize, i: usize) -> Option<&Take> { self.takes.get(p).and_then(|v| v.get(i)).and_then(|t| t.as_ref()) }
     fn has_takes(&self, p: usize) -> bool { self.takes.get(p).map(|v| v.iter().any(|t| t.is_some())).unwrap_or(false) }
     /// How many lines a player dubbed.
     fn dubbed(&self, p: usize) -> usize { self.takes.get(p).map(|v| v.iter().flatten().count()).unwrap_or(0) }
-    /// One player's version of the whole clip.
+    /// One player's version of the whole clip (with roles: everybody's, each in their part).
     fn version(&self, p: usize) -> Vec<f32> {
         // each take ends where the next moment starts, so voices never pile up
-        let takes: Vec<(f32, &[f32], u32)> = self.takes.get(p).map(|v| v.iter().enumerate().filter_map(|(i, t)| t.as_ref().map(|t| {
+        let takes: Vec<(f32, &[f32], u32)> = (0..self.lines.len()).filter_map(|i| {
+            let t = if self.cast.is_some() { self.take_of(i) } else { self.take(p, i) }?;
             let next = self.lines.get(i + 1).map(|n| n.start).unwrap_or(f32::MAX);
             let n = (((next - t.at).max(0.0) * t.sr as f32) as usize).min(t.samples.len());
-            (t.at, &t.samples[..n], t.sr)
-        })).collect()).unwrap_or_default();
+            Some((t.at, &t.samples[..n], t.sr))
+        }).collect();
         mix(&self.background(), self.sr, self.bg, &takes)
     }
     fn dur(&self) -> f32 { self.orig.len() as f32 / self.sr as f32 }
@@ -659,13 +727,17 @@ fn moments_editor(ui: &mut egui::Ui, d: &mut Dub, width: f32, head: Option<f32>,
         k += step;
     }
     // moments
+    let roles = d.roles();
     for (i, l) in d.lines.iter().enumerate() {
         if l.end < v0 || l.start > v1 { continue; }
         let mr = Rect::from_min_max(Pos2::new(x(l.start).max(inner.left()), r.top() + 4.0), Pos2::new(x(l.end).min(inner.right()), r.bottom() - 4.0));
         let sel = d.sel == Some(i) || d.cut_mode;
         p.rect_filled(mr, CornerRadius::same(6), if sel { Color32::from_rgba_unmultiplied(86, 204, 242, 46) } else { Color32::from_rgba_unmultiplied(255, 181, 71, 34) });
         p.rect_stroke(mr, CornerRadius::same(6), Stroke::new(if sel { 2.5_f32 } else { 1.5 }, if sel { wave::W_FRAME } else { AMBER() }), egui::StrokeKind::Inside);
-        p.text(mr.left_top() + Vec2::new(6.0, 4.0), Align2::LEFT_TOP, format!("{}", i + 1), bold(12.0), if sel { wave::W_FRAME } else { AMBER() });
+        let rc = role_col(&roles, &l.role);
+        let head = if l.role.is_empty() { format!("{}", i + 1) } else { format!("{} · {}", i + 1, l.role) };
+        p.with_clip_rect(mr.shrink(2.0)).text(mr.left_top() + Vec2::new(6.0, 4.0), Align2::LEFT_TOP, head, bold(12.0), if sel { wave::W_FRAME } else if l.role.is_empty() { AMBER() } else { rc });
+        if !l.role.is_empty() { p.rect_filled(Rect::from_min_size(mr.left_bottom() - Vec2::new(0.0, 4.0), Vec2::new(mr.width(), 4.0)), CornerRadius::same(2), rc); }
         if !l.text.is_empty() && mr.width() > 50.0 {
             p.with_clip_rect(mr.shrink(4.0)).text(mr.left_bottom() + Vec2::new(6.0, -14.0), Align2::LEFT_BOTTOM, &l.text, semibold(11.0), Color32::from_white_alpha(225));
         }
@@ -858,8 +930,34 @@ fn moments_editor(ui: &mut egui::Ui, d: &mut Dub, width: f32, head: Option<f32>,
                 if !d.cut_mode {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("текст").font(body(12.0)).color(MUTED()));
-                        let r = ui.add(egui::TextEdit::singleline(&mut d.lines[i].text).hint_text("что здесь говорят — подсказка при записи").font(body(13.0)).desired_width(width - 90.0));
+                        let hint = if d.improv { "по желанию: подсказка, о чём сцена" } else { "что здесь говорят — подсказка при записи" };
+                        let r = ui.add(egui::TextEdit::singleline(&mut d.lines[i].text).hint_text(hint).font(body(13.0)).desired_width(width - 90.0));
                         if r.lost_focus() { *act = Some((51, i)); }
+                    });
+                    // who says it: the clip's characters as chips, «+» names a new one
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = Vec2::new(5.0, 5.0);
+                        ui.label(RichText::new("кто говорит").font(body(12.0)).color(MUTED()));
+                        let roles = d.roles();
+                        let chip = |ui: &mut egui::Ui, lab: &str, on: bool, col: Color32| {
+                            let t = RichText::new(lab).font(semibold(12.0)).color(if on { Color32::BLACK } else { TEXT_2() });
+                            ui.add(egui::Button::new(t).fill(if on { col } else { CHIP() }).corner_radius(8.0).min_size(Vec2::new(0.0, 26.0))).clicked()
+                        };
+                        if chip(ui, "—", d.lines[i].role.is_empty(), AMBER()) { d.lines[i].role.clear(); *act = Some((51, i)); }
+                        for r in &roles {
+                            if chip(ui, r, &d.lines[i].role == r, role_col(&roles, r)) { d.lines[i].role = r.clone(); *act = Some((51, i)); }
+                        }
+                        match &mut d.new_role {
+                            None => { if kit::link(ui, "+ персонаж").on_hover_text("Например «Шрек» — потом каждый игрок выберет, кого озвучивает").clicked() { d.new_role = Some(String::new()); } }
+                            Some(name) => {
+                                let r = ui.add(egui::TextEdit::singleline(name).hint_text("имя").desired_width(110.0).font(body(12.0)));
+                                if name.is_empty() && !r.has_focus() && !r.lost_focus() { r.request_focus(); }
+                                let enter = r.lost_focus() && ui.input(|k| k.key_pressed(egui::Key::Enter));
+                                let n = name.trim().to_string();
+                                if enter && !n.is_empty() { d.lines[i].role = n; d.new_role = None; *act = Some((51, i)); }
+                                else if r.lost_focus() { d.new_role = None; }
+                            }
+                        }
                     });
                 }
             }
@@ -950,6 +1048,12 @@ fn voice_panel(p: &egui::Painter, r: Rect, d: &Dub) {
 
 /// One line under the voice window: the original's note and how far you are from it.
 fn voice_hint(d: &Dub) -> (String, Color32) {
+    if d.improv {
+        return match d.mon.as_ref().and_then(|m| m.midi()) {
+            Some(n) => (format!("Твой голос: {} — громче, с выражением!", note_name(n)), OK_TEXT()),
+            None => ("Голубая линия — твой голос. Придумай, что тут говорят!".to_string(), MUTED()),
+        };
+    }
     let orig = d.refc.as_ref().and_then(|(_, _, c)| median_note(c));
     let now = d.mon.as_ref().and_then(|m| m.midi());
     match (orig, now) {
@@ -1067,14 +1171,20 @@ impl App {
                 upgrade_old_trim(&p);
                 d.clean = crate::separate::load_cached(&p, d.orig.len(), d.sr);
                 let mut fresh = false;
+                d.improv = is_improv(&p);
+                d.cast = None; d.new_role = None;
                 match load_lines(&p) { Some(v) => d.lines = v.into_iter().filter(|l| l.start < d.dur()).map(|l| Line { end: l.end.min(d.dur()), ..l }).collect(), None => { d.resplit(); fresh = true; } }
-                if d.lines.is_empty() { d.resplit(); }
+                if d.lines.is_empty() && !d.improv { d.resplit(); }
+                // no words in the clip at all: then it is for improvisation
+                let wordless = d.lines.is_empty();
+                if wordless { d.improv = true; d.lines = even_parts(d.dur(), 6.0); d.save(); }
                 d.cur = 0;
                 d.phase = DPhase::Edit;
                 d.loading = false;
                 let long = d.dur() >= MAX_SECS - 0.5;
                 if d.video { self.pending_video = Some(file_url(&p)); }
                 if long { self.say("Ролик длинный — взял первые 3 минуты"); }
+                if wordless { self.say("Слов в ролике нет — включил импровизацию: игроки сами придумывают реплики"); }
                 let sep = self.dub.as_ref().map(|d| d.clean.is_none()).unwrap_or(false) && crate::separate::available();
                 if play { self.dub_begin(); } else { self.boris.queue("Редактор! Подвиньте моменты, если где-то лишнее.".into()); }
                 if sep { self.dub_listen(fresh); }
@@ -1123,7 +1233,11 @@ impl App {
     /// Make line `i` current and play its original right away.
     fn dub_goto(&mut self, i: usize) {
         let n = self.dub.as_ref().map(|d| d.lines.len()).unwrap_or(0);
-        if let Some(d) = &mut self.dub { d.cur = i.min(n); d.intro = false; }
+        if let Some(d) = &mut self.dub {
+            d.cur = i.min(n); d.intro = false;
+            // with roles the microphone passes to whoever plays this character
+            if d.phase == DPhase::Record { if let Some(o) = d.owner(d.cur) { d.who = o; } }
+        }
         if i < n { self.dub_preview(i); }
     }
 
@@ -1155,6 +1269,7 @@ impl App {
         // (the lead-in second too) is free of voices; otherwise the voices are cut in the moments
         let bg = if d.rec_bg {
             let full = d.clean.clone().filter(|_| d.devoice).unwrap_or_else(|| d.background());
+            // (improvisation without the neural net: background() is the original sound)
             let a = ((at * d.sr as f32) as usize).min(full.len());
             let b = (((stop + 0.3) * d.sr as f32) as usize).min(full.len()).max(a);
             Some(full[a..b].iter().map(|v| v * 0.7).collect::<Vec<f32>>())
@@ -1238,7 +1353,7 @@ impl App {
                     let _ = std::fs::remove_file(crate::separate::cache_path(&scene));
                 }
                 let _ = std::fs::remove_file(crate::separate::cache_path(&p));
-                save_lines(&p, &moved);
+                save_lines_as(&p, &moved, d.improv);
                 if let Some(c) = clean { crate::separate::save_cache(&p, &c, d.sr); }
                 d.scan();
                 let how = if exact { "" } else { " (по ключевым кадрам: в этой Windows нет кодировщика H.264 — края могут сдвинуться на долю секунды)" };
@@ -1250,23 +1365,50 @@ impl App {
     }
 
     /// Start dubbing the loaded clip: whole clip first (fresh start), then moment by moment.
+    /// «Озвучивать»: a clip with characters goes to the casting first, otherwise straight to recording.
     fn dub_begin(&mut self) {
         let players = roster(&self.settings);
         let Some(d) = &mut self.dub else { return };
         if d.lines.is_empty() { self.say("В ролике нет моментов — нажмите ✂ и отметьте их на волне"); return; }
+        let roles = d.roles();
+        if roles.is_empty() { d.cast = None; self.dub_start(); return; }
+        // who plays whom: keep the last casting if it still fits, else deal the roles out in turn
+        let n = players.len().max(1);
+        let fits = d.cast.as_ref().map(|c| c.iter().map(|x| &x.0).eq(roles.iter()) && c.iter().all(|x| x.1.map(|p| p < n).unwrap_or(true))).unwrap_or(false);
+        if !fits { d.cast = Some(roles.into_iter().enumerate().map(|(k, r)| (r, Some((d.next_who + k) % n))).collect()); }
+        d.players = players;
+        d.phase = DPhase::Cast;
+        self.boris.queue("Распределяем роли! Кто кого играет?".into());
+    }
+
+    /// Start recording: one player the whole clip, or everybody in their roles.
+    fn dub_start(&mut self) {
+        let players = roster(&self.settings);
+        let Some(d) = &mut self.dub else { return };
         // other players' versions of this clip stay for comparison, if the list is the same
         if d.players != players || d.takes.iter().any(|v| v.len() != d.lines.len()) { d.takes.clear(); }
         d.players = players;
         d.takes.resize(d.players.len(), vec![]);
         for v in &mut d.takes { v.resize(d.lines.len(), None); }
-        d.who = d.next_who.min(d.players.len() - 1);
-        let w = d.who;
-        d.takes[w] = vec![None; d.lines.len()];
-        d.phase = DPhase::Record; d.sel = None; d.cur = 0; d.intro = true;
-        let name = d.players[w].clone();
+        let names: String;
+        if d.cast.is_some() {
+            // a new version of the whole team
+            for v in &mut d.takes { *v = vec![None; d.lines.len()]; }
+            names = d.cast_line();
+        } else {
+            d.who = d.next_who.min(d.players.len() - 1);
+            let w = d.who;
+            d.takes[w] = vec![None; d.lines.len()];
+            names = format!("озвучивает {}", d.players[w]);
+        }
+        d.phase = DPhase::Record; d.sel = None; d.intro = true;
+        // the first moment somebody dubs (with roles some stay in the original)
+        d.cur = d.next_open(0).min(d.lines.len().saturating_sub(1));
+        if let Some(o) = d.owner(d.cur) { d.who = o; }
+        let improv = d.improv;
         // first the whole clip with sound, then moment by moment
         self.dub_play_all();
-        self.boris.queue(format!("Мотор! Озвучивает {name}. Сначала смотрим сцену целиком."));
+        self.boris.queue(if improv { format!("Импровизация! {names}. Смотрим сцену и придумываем, что они говорят.") } else { format!("Мотор! {names}. Сначала смотрим сцену целиком.") });
     }
 
     /// Editor: play from the white cursor to the end.
@@ -1298,7 +1440,10 @@ impl App {
         let Some(d) = &mut self.dub else { return };
         let name = d.players.get(d.who).cloned().unwrap_or_default();
         if video { self.dub_js("window.kj && kj(-1, false);"); }
-        if done { self.boris.queue(format!("{name} озвучил весь ролик! Жмите «Смотреть результат».")); }
+        if done {
+            let roles = self.dub.as_ref().map(|d| d.cast.is_some()).unwrap_or(false);
+            self.boris.queue(if roles { "Все роли записаны! Жмите «Смотреть результат».".to_string() } else { format!("{name} озвучил весь ролик! Жмите «Смотреть результат».") });
+        }
     }
 
     /// Play player `p`'s version from the start.
@@ -1452,7 +1597,69 @@ impl App {
                         self.say(format!("Моменты из файла: {n}"));
                     }
                 }
-                self.dub_work(ui, ph)
+                if ph == DPhase::Cast { self.dub_cast(ui) } else { self.dub_work(ui, ph) }
+            }
+        }
+    }
+
+    /// «Кто кого играет»: every character of the clip gets a player (or keeps its own voice).
+    fn dub_cast(&mut self, ui: &mut egui::Ui) {
+        let mut act: Option<(u8, usize)> = None;
+        let w = 680.0f32.min(ui.available_width() - 40.0);
+        ui.vertical_centered(|ui| {
+            ui.add_space(24.0);
+            ui.set_max_width(w);
+            let d = self.dub.as_ref().unwrap();
+            ui.label(RichText::new("Кто кого играет").font(display(36.0)));
+            ui.add_space(6.0);
+            kit::text(ui, "Каждый озвучивает своего персонажа — по ходу сцены микрофон передаётся тому, чья реплика. Кого никто не играет, тот говорит своим голосом.", body(15.0), MUTED(), w);
+            ui.add_space(16.0);
+            let roles = d.roles();
+            kit::card(ui, SURFACE(), |ui| {
+                ui.set_width(w - 40.0);
+                for (k, (r, who)) in d.cast.clone().unwrap_or_default().iter().enumerate() {
+                    let n = d.lines.iter().filter(|l| &l.role == r).count();
+                    ui.horizontal(|ui| {
+                        let (dot, _) = ui.allocate_exact_size(Vec2::splat(14.0), egui::Sense::hover());
+                        ui.painter().circle_filled(dot.center(), 6.0, role_col(&roles, r));
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            ui.label(RichText::new(r).font(semibold(17.0)));
+                            ui.label(RichText::new(format!("реплик: {n}")).font(body(12.0)).color(MUTED()));
+                        });
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                        ui.add_space(22.0);
+                        for (p, name) in d.players.iter().enumerate() {
+                            let on = *who == Some(p);
+                            let t = RichText::new(name).font(semibold(14.0)).color(if on { Color32::BLACK } else { TEXT_2() });
+                            if ui.add(egui::Button::new(t).fill(if on { pcol(p) } else { CHIP() }).corner_radius(10.0).min_size(Vec2::new(0.0, 34.0))).clicked() { act = Some((53, k * 1000 + p + 1)); }
+                        }
+                        let on = who.is_none();
+                        let t = RichText::new("оригинал").font(semibold(14.0)).color(if on { Color32::BLACK } else { MUTED() });
+                        if ui.add(egui::Button::new(t).fill(if on { Color32::from_gray(215) } else { CHIP() }).corner_radius(10.0).min_size(Vec2::new(0.0, 34.0))).on_hover_text("Этого персонажа никто не озвучивает — звучит как в фильме").clicked() { act = Some((53, k * 1000)); }
+                    });
+                    ui.add_space(10.0);
+                }
+                let free = d.lines.iter().filter(|l| l.role.is_empty()).count();
+                if free > 0 { ui.label(RichText::new(format!("Реплик без персонажа: {free} — они останутся в оригинале. Назначить можно в редакторе (✂).")).font(body(12.0)).color(MUTED())); }
+            });
+            ui.add_space(18.0);
+            let any = d.cast.as_ref().map(|c| c.iter().any(|x| x.1.is_some())).unwrap_or(false);
+            ui.add_enabled_ui(any, |ui| {
+                if kit::button_ex(ui, Kind::Primary, "Мотор!", Some(Icon::Mic), Vec2::new(320.0, 64.0), bold(20.0), 18).clicked() { act = Some((52, 0)); }
+            });
+            if !any { ui.label(RichText::new("Выберите хотя бы одного игрока").font(body(13.0)).color(AMBER_TEXT())); }
+        });
+        if let Some((a, i)) = act {
+            match a {
+                52 => self.dub_start(),
+                53 => if let Some(c) = self.dub.as_mut().and_then(|d| d.cast.as_mut()) {
+                    let (k, p) = (i / 1000, i % 1000);
+                    if let Some(x) = c.get_mut(k) { x.1 = (p > 0).then(|| p - 1); }
+                },
+                _ => {}
             }
         }
     }
@@ -1620,8 +1827,9 @@ impl App {
         if let Some(d) = &mut self.dub {
             if ph == DPhase::Record && d.cur < d.lines.len() && d.refc.as_ref().map(|r| r.0 != d.cur).unwrap_or(true) {
                 let (a, b) = d.span(d.cur);
-                let c = contour(&d.piece(a, b), d.sr);
-                d.refenv = wave::envelope(&d.piece(a, b), d.sr, 500);
+                let improv = d.improv;
+                let c = if improv { vec![] } else { contour(&d.piece(a, b), d.sr) };
+                d.refenv = if improv { wave::Env::default() } else { wave::envelope(&d.piece(a, b), d.sr, 500) };
                 d.refc = Some((d.cur, a, c));
                 d.live.clear();
                 d.live_lvl.clear();
@@ -1659,8 +1867,10 @@ impl App {
                         let x0 = tl.left() + tl.width() * l.start / dur;
                         let x1 = (tl.left() + tl.width() * l.end / dur).max(x0 + 3.0);
                         let r = Rect::from_min_max(Pos2::new(x0, tl.top() + 4.0), Pos2::new(x1, tl.bottom() - 4.0));
-                        let c = pcol(d.who);
-                        p.rect_filled(r, CornerRadius::same(3), if d.take(d.who, i).is_some() { c } else { c.gamma_multiply(0.3) });
+                        match d.owner(i) {
+                            Some(o) => p.rect_filled(r, CornerRadius::same(3), if d.take_of(i).is_some() { pcol(o) } else { pcol(o).gamma_multiply(0.3) }),
+                            None => p.rect_filled(r.shrink2(Vec2::new(0.0, 5.0)), CornerRadius::same(2), BAR_OFF()),
+                        };
                     }
                     // a running cursor whenever something plays: the premiere, the whole clip at the start, a moment
                     let now = d.show_since.map(|t0| t0.elapsed().as_secs_f32()).or_else(|| d.play_from.map(|(t0, f)| f + t0.elapsed().as_secs_f32()));
@@ -1671,13 +1881,20 @@ impl App {
                     }
                 }
                 if ph == DPhase::Record && d.cur < d.lines.len() && !d.intro {
-                    // the prompter: what is said in this moment
-                    let txt = d.lines[d.cur].text.trim();
-                    if !txt.is_empty() {
+                    // the prompter: who speaks and what is said in this moment
+                    let (txt, role) = (d.lines[d.cur].text.trim(), d.lines[d.cur].role.trim());
+                    if !txt.is_empty() || !role.is_empty() || d.improv {
                         ui.add_space(10.0);
                         egui::Frame::new().fill(SURFACE()).corner_radius(12.0).inner_margin(egui::Margin::symmetric(14, 10)).show(ui, |ui| {
                             ui.set_width(left_w - 28.0);
-                            ui.label(RichText::new(format!("«{txt}»")).font(bold(20.0)).color(TEXT()));
+                            if !role.is_empty() { ui.label(RichText::new(role).font(semibold(14.0)).color(role_col(&d.roles(), role))); }
+                            if d.improv {
+                                let hero = if role.is_empty() { "герой" } else { role };
+                                ui.label(RichText::new(format!("Импровизация: что тут говорит {hero}?")).font(bold(20.0)).color(TEXT()));
+                                if !txt.is_empty() { ui.label(RichText::new(txt).font(body(14.0)).color(MUTED())); }
+                            } else if !txt.is_empty() {
+                                ui.label(RichText::new(format!("«{txt}»")).font(bold(20.0)).color(TEXT()));
+                            }
                         });
                     }
                     ui.add_space(10.0);
@@ -1707,8 +1924,14 @@ impl App {
                             ui.label(RichText::new(format!("{} моментов. Всё сохраняется само.", d.lines.len())).font(body(14.0)).color(MUTED()));
                         }
                         DPhase::Record => {
-                            let who = d.players.get(d.who).cloned().unwrap_or_default();
-                            if d.cur < d.lines.len() {
+                            let mut who = d.players.get(d.who).cloned().unwrap_or_default();
+                            if d.cast.is_some() { if let Some(l) = d.lines.get(d.cur).filter(|l| !l.role.is_empty()) { who = format!("{who} ({})", l.role); } }
+                            if d.cur < d.lines.len() && d.owner(d.cur).is_none() && !d.intro && d.rec_since.is_none() {
+                                // a character nobody plays: it keeps its own voice
+                                if kit::button_ex(ui, Kind::Primary, "Следующий момент", Some(Icon::Mic), big, bold(21.0), 20).clicked() { act = Some((23, 0)); }
+                                ui.add_space(8.0);
+                                ui.label(RichText::new("Эту реплику никто не играет — она остаётся как в оригинале.").font(body(14.0)).color(MUTED()));
+                            } else if d.cur < d.lines.len() {
                                 if d.rec_since.is_some() {
                                     if kit::button_ex(ui, Kind::Primary, &format!("Стоп — {who}"), Some(Icon::Stop), big, bold(21.0), 20).clicked() { act = Some((12, 0)); }
                                     ui.add_space(8.0);
@@ -1717,7 +1940,7 @@ impl App {
                                     if kit::button_ex(ui, Kind::Primary, "Пропустить просмотр", Some(Icon::Play), big, bold(21.0), 20).clicked() { act = Some((22, 0)); }
                                     ui.add_space(8.0);
                                     ui.label(RichText::new("Сначала смотрим ролик целиком — со звуком. Потом пойдём по моментам.").font(body(14.0)).color(MUTED()));
-                                } else if d.take(d.who, d.cur).is_some() {
+                                } else if d.take_of(d.cur).is_some() {
                                     let more = d.next_open(d.cur) < d.lines.len();
                                     let (label, code) = if more { ("Следующий момент".to_string(), 23) } else { ("Смотреть результат".to_string(), 14) };
                                     if kit::button_ex(ui, Kind::Primary, &label, Some(if code == 14 { Icon::Play } else { Icon::Mic }), big, bold(21.0), 20).clicked() { act = Some((code, 0)); }
@@ -1728,7 +1951,7 @@ impl App {
                                         ui.spacing_mut().item_spacing.x = 10.0;
                                         if kit::button_ex(ui, Kind::Ghost, "Перезаписать", Some(Icon::Repeat), Vec2::new(200.0, 42.0), semibold(14.0), 12).clicked() { act = Some((11, 0)); }
                                         if kit::button_ex(ui, Kind::Ghost, "Моя запись", Some(Icon::Headphones), Vec2::new(200.0, 42.0), semibold(14.0), 12).clicked() { act = Some((3, d.cur)); }
-                                        if kit::button_ex(ui, Kind::Ghost, "Оригинал", Some(Icon::Play), Vec2::new(200.0, 42.0), semibold(14.0), 12).clicked() { act = Some((2, d.cur)); }
+                                        if kit::button_ex(ui, Kind::Ghost, if d.improv { "Кусок ролика" } else { "Оригинал" }, Some(Icon::Play), Vec2::new(200.0, 42.0), semibold(14.0), 12).clicked() { act = Some((2, d.cur)); }
                                     });
                                 } else if let Some(st) = d.cleaning() {
                                     ui.add_enabled_ui(false, |ui| kit::button_ex(ui, Kind::Primary, "Нейросеть работает…", Some(Icon::Mic), big, bold(21.0), 20));
@@ -1747,7 +1970,7 @@ impl App {
                                     ui.add_space(10.0);
                                     ui.allocate_ui_with_layout(Vec2::new(620.0, 44.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
                                         ui.spacing_mut().item_spacing.x = 10.0;
-                                        if kit::button_ex(ui, Kind::Ghost, "Послушать оригинал", Some(Icon::Play), Vec2::new(200.0, 42.0), semibold(14.0), 12).clicked() { act = Some((2, d.cur)); }
+                                        if kit::button_ex(ui, Kind::Ghost, if d.improv { "Посмотреть кусок" } else { "Послушать оригинал" }, Some(Icon::Play), Vec2::new(200.0, 42.0), semibold(14.0), 12).clicked() { act = Some((2, d.cur)); }
                                         let busy = d.play_from.is_some();
                                         if kit::button_ex(ui, Kind::Ghost, if busy { "Остановить" } else { "Весь ролик" }, Some(if busy { Icon::Stop } else { Icon::Play }), Vec2::new(200.0, 42.0), semibold(14.0), 12).clicked() { act = Some(if busy { (18, 0) } else { (17, 0) }); }
                                         if kit::button_ex(ui, Kind::Ghost, "Пропустить", None, Vec2::new(200.0, 42.0), semibold(14.0), 12).clicked() { act = Some((13, 0)); }
@@ -1763,7 +1986,8 @@ impl App {
                             let next = d.players.get((d.who + 1) % d.players.len().max(1)).cloned().unwrap_or_default();
                             ui.allocate_ui_with_layout(Vec2::new(620.0, 64.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
                                 ui.spacing_mut().item_spacing.x = 10.0;
-                                if kit::button_ex(ui, Kind::Primary, &format!("Следующий — {next}"), Some(Icon::Mic), Vec2::new(300.0, 60.0), bold(17.0), 16).on_hover_text("Этот же ролик, следующий игрок").clicked() { act = Some((43, 0)); }
+                                let (lab, tip) = if d.cast.is_some() { ("Поменяться ролями".to_string(), "Этот же ролик — роли переходят к следующему игроку") } else { (format!("Следующий — {next}"), "Этот же ролик, следующий игрок") };
+                                if kit::button_ex(ui, Kind::Primary, &lab, Some(Icon::Mic), Vec2::new(300.0, 60.0), bold(17.0), 16).on_hover_text(tip).clicked() { act = Some((43, 0)); }
                                 if kit::button_ex(ui, Kind::Ghost, "Другой ролик", Some(Icon::Folder), Vec2::new(300.0, 60.0), semibold(16.0), 16).on_hover_text("К списку роликов").clicked() { act = Some((44, 0)); }
                             });
                             ui.add_space(10.0);
@@ -1777,7 +2001,7 @@ impl App {
                                 if kit::button_ex(ui, Kind::Ghost, "Переозвучить", Some(Icon::Mic), Vec2::new(200.0, 42.0), semibold(14.0), 12).on_hover_text("Тот же игрок ещё раз").clicked() { act = Some((16, 0)); }
                             });
                         }
-                        DPhase::Setup => {}
+                        DPhase::Setup | DPhase::Cast => {}
                     }
                 });
             });
@@ -1788,9 +2012,23 @@ impl App {
                 if ph == DPhase::Final {
                     kit::card(ui, SURFACE(), |ui| {
                         ui.set_width(col_w - 40.0);
-                        kit::section_label(ui, "ВЕРСИИ");
+                        kit::section_label(ui, if d.cast.is_some() { "ВЕРСИЯ ПО РОЛЯМ" } else { "ВЕРСИИ" });
                         ui.add_space(6.0);
-                        let rows: Vec<(usize, usize)> = (0..d.players.len()).map(|p| (p, d.dubbed(p))).filter(|r| r.1 > 0).collect();
+                        if let Some(c) = d.cast.clone() {
+                            let roles = d.roles();
+                            for (r, p) in &c {
+                                ui.horizontal(|ui| {
+                                    let (dot, _) = ui.allocate_exact_size(Vec2::splat(12.0), egui::Sense::hover());
+                                    ui.painter().circle_filled(dot.center(), 5.0, role_col(&roles, r));
+                                    ui.label(RichText::new(r).font(semibold(15.0)));
+                                    ui.label(RichText::new("—").color(MUTED()));
+                                    match p { Some(p) => { ui.label(RichText::new(&d.players[*p]).font(semibold(15.0)).color(pcol(*p))); } None => { ui.label(RichText::new("оригинал").font(body(14.0)).color(MUTED())); } }
+                                });
+                            }
+                            ui.add_space(6.0);
+                            if kit::button_ex(ui, Kind::Primary, "Смотреть", Some(Icon::Play), Vec2::new(0.0, 36.0), bold(13.0), 10).clicked() { act = Some((20, d.who)); }
+                        }
+                        let rows: Vec<(usize, usize)> = if d.cast.is_some() { vec![] } else { (0..d.players.len()).map(|p| (p, d.dubbed(p))).filter(|r| r.1 > 0).collect() };
                         for (p, n) in &rows {
                             let (r, _) = ui.allocate_exact_size(Vec2::new(col_w - 40.0, 50.0), egui::Sense::hover());
                             let pa = ui.painter();
@@ -1802,7 +2040,7 @@ impl App {
                             let mut cu = ui.new_child(egui::UiBuilder::new().max_rect(br).layout(egui::Layout::right_to_left(egui::Align::Center)));
                             if kit::button_ex(&mut cu, if *p == d.who { Kind::Primary } else { Kind::Ghost }, "Смотреть", Some(Icon::Play), Vec2::new(0.0, 36.0), bold(13.0), 10).clicked() { act = Some((20, *p)); }
                         }
-                        ui.label(RichText::new("Чья версия смешнее — решайте сами!").font(body(12.0)).color(MUTED()));
+                        if d.cast.is_none() { ui.label(RichText::new("Чья версия смешнее — решайте сами!").font(body(12.0)).color(MUTED())); }
                     });
                     ui.add_space(10.0);
                     let sub = if d.clean.is_some() { "Голоса убрала нейросеть — под озвучкой только музыка и звуки." } else { "Без дополнения «Нейросети» голоса оригинала только приглушаются." };
@@ -1825,24 +2063,34 @@ impl App {
                         kit::section_label(ui, if ph == DPhase::Record { "РЕПЛИКИ" } else { "РЕПЛИКИ РОЛИКА" });
                         if ph == DPhase::Record {
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let who = d.players.get(d.who).cloned().unwrap_or_default();
-                                ui.label(RichText::new(format!("озвучивает {who}")).font(semibold(13.0)).color(pcol(d.who)));
+                                if d.cast.is_some() { ui.label(RichText::new("по ролям").font(semibold(13.0)).color(ACCENT_TEXT())); } else {
+                                    let who = d.players.get(d.who).cloned().unwrap_or_default();
+                                    ui.label(RichText::new(format!("озвучивает {who}")).font(semibold(13.0)).color(pcol(d.who)));
+                                }
                             });
                         }
                     });
                     if ph == DPhase::Edit {
-                        if kit::link(ui, "Нарезать заново").on_hover_text("Найти моменты автоматически ещё раз (ручные правки пропадут)").clicked() { act = Some((6, 0)); }
+                        if kit::link(ui, "Нарезать заново").on_hover_text(if d.improv { "Разбить ролик на равные куски по ~6 секунд (ручные правки пропадут)" } else { "Найти моменты автоматически ещё раз (ручные правки пропадут)" }).clicked() { act = Some((6, 0)); }
+                        ui.add_space(4.0);
+                        let mut on = d.improv;
+                        if kit::switch_row(ui, "Импровизация", "Слов повторять не нужно — игроки сами придумывают, что говорят герои", &mut on, true) { act = Some((55, 0)); }
+                        if !d.roles().is_empty() {
+                            ui.add_space(2.0);
+                            ui.label(RichText::new(format!("Роли: {}. При «Озвучивать» игроки выберут, кто кого играет.", d.roles().join(", "))).font(body(12.0)).color(MUTED()));
+                        }
                     }
                     ui.add_space(4.0);
                     egui::ScrollArea::vertical().max_height((avail.y - 120.0).max(200.0)).auto_shrink([false, true]).show(ui, |ui| {
                         for (i, l) in d.lines.iter().enumerate() {
-                            let tk = d.take(d.who, i).is_some() && ph == DPhase::Record;
+                            let tk = d.take_of(i).is_some() && ph == DPhase::Record;
+                            let own = if ph == DPhase::Record { d.owner(i) } else { Some(d.who) };
                             let cur = (ph == DPhase::Record && i == d.cur) || (ph == DPhase::Edit && d.sel == Some(i));
                             egui::Frame::new().fill(if cur { ACCENT_SOFT() } else { Color32::TRANSPARENT }).corner_radius(10.0).inner_margin(egui::Margin::symmetric(6, 3)).show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     ui.spacing_mut().item_spacing.x = 6.0;
                                     let (r, _) = ui.allocate_exact_size(Vec2::new(26.0, 26.0), egui::Sense::hover());
-                                    let col = if ph == DPhase::Edit { AMBER() } else if tk { pcol(d.who) } else { CHIP() };
+                                    let col = if ph == DPhase::Edit { if l.role.is_empty() { AMBER() } else { role_col(&d.roles(), &l.role) } } else if tk { pcol(own.unwrap_or(d.who)) } else { CHIP() };
                                     ui.painter().circle_filled(r.center(), 11.0, col);
                                     ui.painter().text(r.center(), Align2::CENTER_CENTER, format!("{}", i + 1), bold(11.0), if col == CHIP() { TEXT_2() } else { Color32::BLACK });
                                     ui.vertical(|ui| {
@@ -1850,9 +2098,13 @@ impl App {
                                         let lab = ui.add(egui::Label::new(RichText::new(format!("{}–{}", fmt_time(l.start), fmt_time(l.end))).font(semibold(13.0)).color(if d.sel == Some(i) { ACCENT_TEXT() } else { TEXT() })).sense(egui::Sense::click()));
                                         if ph == DPhase::Edit && lab.on_hover_text("Изменить края момента").clicked() { act = Some((24, i)); }
                                         let secs = format!("{:.1} с", l.end - l.start).replace('.', ",");
-                                        let st = if tk { "записано".to_string() } else if l.text.trim().is_empty() { secs } else {
-                                            let t: String = l.text.trim().chars().take(34).collect();
-                                            format!("{}{} · {secs}", t, if l.text.trim().chars().count() > 34 { "…" } else { "" })
+                                        let who = |p: usize| d.players.get(p).cloned().unwrap_or_default();
+                                        let role = if l.role.is_empty() { String::new() } else if ph == DPhase::Record && d.cast.is_some() {
+                                            format!("{} — {} · ", l.role, own.map(who).unwrap_or_else(|| "оригинал".into()))
+                                        } else { format!("{} · ", l.role) };
+                                        let st = if tk { format!("{role}записано") } else if l.text.trim().is_empty() { format!("{role}{secs}") } else {
+                                            let t: String = l.text.trim().chars().take(30).collect();
+                                            format!("{role}{}{} · {secs}", t, if l.text.trim().chars().count() > 30 { "…" } else { "" })
                                         };
                                         ui.label(RichText::new(st).font(body(11.0)).color(if tk { OK_TEXT() } else { MUTED() }));
                                     });
@@ -1963,7 +2215,7 @@ impl App {
                         // the words are shared out by time
                         let (t1, t2) = split_text(&l.text, (c - l.start) / (l.end - l.start));
                         d.lines[i].text = t1;
-                        d.lines.insert(i + 1, Line { start: c + 0.03, end: l.end, text: t2 });
+                        d.lines.insert(i + 1, Line { start: c + 0.03, end: l.end, text: t2, role: l.role.clone() });
                         d.save(); d.takes.clear();
                     }
                 }
@@ -1973,7 +2225,7 @@ impl App {
                     let scene = d.scene.clone()?;
                     let m = d.version(d.who);
                     let sr = d.sr;
-                    let who = d.players.get(d.who).cloned().unwrap_or_default();
+                    let who = if d.cast.is_some() { "команда".to_string() } else { d.players.get(d.who).cloned().unwrap_or_default() };
                     let out = done_dir(&d.root).join(format!("{} — озвучка {who} {}.mp4", scene_name(&scene), audio::stamp().replace(':', "-")));
                     Some(std::thread::spawn(move || {
                         let wav = std::env::temp_dir().join(format!("kj_dub_{}.wav", std::process::id()));
@@ -1993,12 +2245,13 @@ impl App {
             }
             11 => self.dub_start_rec(),
             12 => self.dub_stop_rec(),
-            13 => { let n = self.dub.as_ref().map(|d| (d.cur + 1..d.lines.len()).find(|&k| d.take(d.who, k).is_none()).unwrap_or(d.lines.len())).unwrap_or(0); self.dub_goto(n); }
+            13 => { let n = self.dub.as_ref().map(|d| (d.cur + 1..d.lines.len()).find(|&k| d.owner(k).is_some() && d.take_of(k).is_none()).unwrap_or(d.lines.len())).unwrap_or(0); self.dub_goto(n); }
             14 => {
                 // the premiere of this player's version
-                let r = self.dub.as_ref().filter(|d| d.has_takes(d.who)).map(|d| {
-                    let others = (0..d.players.len()).filter(|&p| p != d.who && d.has_takes(p)).count();
-                    (d.who, d.players[d.who].clone(), others)
+                let r = self.dub.as_ref().filter(|d| if d.cast.is_some() { d.any_takes() } else { d.has_takes(d.who) }).map(|d| {
+                    let others = if d.cast.is_some() { 0 } else { (0..d.players.len()).filter(|&p| p != d.who && d.has_takes(p)).count() };
+                    let who = if d.cast.is_some() { format!("команды: {}", d.cast_line()) } else { d.players[d.who].clone() };
+                    (d.who, who, others)
                 });
                 let Some((p, who, others)) = r else { self.say("Сначала запишите хотя бы одну реплику"); return; };
                 self.dub_show(p);
@@ -2006,11 +2259,21 @@ impl App {
                 let wow = ["Это шедевр!", "Учитесь, студенты!", "Сильно! Мощно!", "Оскар уже выехал!"][k % 4];
                 self.boris.queue(if others > 0 { format!("Премьера! Версия {who}. {wow} А чья смешнее — решайте сами.") } else { format!("Премьера! Версия {who}. {wow}") });
             }
-            43 => { // the next player, same clip
+            43 => { // the next player, same clip (with roles: swap them round)
                 self.dub_stop_play();
-                if let Some(d) = &mut self.dub { d.next_who = (d.who + 1) % d.players.len().max(1); d.show_since = None; }
+                if let Some(d) = &mut self.dub {
+                    let n = d.players.len().max(1);
+                    if let Some(c) = &mut d.cast { for x in c.iter_mut() { x.1 = x.1.map(|p| (p + 1) % n); } }
+                    d.next_who = (d.who + 1) % n; d.show_since = None;
+                }
                 self.dub_begin();
             }
+            55 => if let Some(d) = &mut self.dub { // improvisation on/off
+                d.improv = !d.improv;
+                // automatic moments (no words, no characters) → equal parts to improvise over
+                if d.improv && d.lines.iter().all(|l| l.text.is_empty() && l.role.is_empty()) { d.lines = even_parts(d.dur(), 6.0); d.sel = None; d.takes.clear(); }
+                d.save();
+            },
             44 => { // another clip: back to the list, the next player already chosen
                 self.dub_stop_play();
                 if let Some(d) = &mut self.dub { d.next_who = (d.who + 1) % d.players.len().max(1); d.show_since = None; d.phase = DPhase::Setup; d.scan(); }
@@ -2049,7 +2312,7 @@ impl App {
                 let r = self.dub.as_ref().map(|d| {
                     let m = d.version(d.who);
                     let name = d.scene.as_ref().map(|p| scene_name(p)).unwrap_or_default();
-                    let who = d.players.get(d.who).cloned().unwrap_or_default();
+                    let who = if d.cast.is_some() { "команда".to_string() } else { d.players.get(d.who).cloned().unwrap_or_default() };
                     let path = done_dir(&d.root).join(format!("{name} — озвучка {who} {}.wav", audio::stamp().replace(':', "-")));
                     audio::write_wav(&path, &m, d.sr).map(|_| path)
                 });
@@ -2167,7 +2430,7 @@ mod tests {
 
     #[test]
     fn moments_keep_their_text() {
-        let v = vec![Line { start: 0.9, end: 4.7, text: "Привет, болото, ты кто такой?".into() }, Line::new(8.2, 11.1)];
+        let v = vec![Line { start: 0.9, end: 4.7, text: "Привет, болото, ты кто такой?".into(), role: "Осёл".into() }, Line::new(8.2, 11.1)];
         let dir = std::env::temp_dir().join(format!("kj_txt_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let sc = dir.join("a.mp4");
@@ -2181,9 +2444,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(split_text("раз два три четыре", 0.5), ("раз два".into(), "три четыре".into()));
         // a cut keeps the moments where they were in the picture
-        let m = vec![Line { start: 2.0, end: 3.0, text: "а".into() }, Line::new(5.0, 6.0), Line::new(10.5, 11.5)];
+        let m = vec![Line { start: 2.0, end: 3.0, text: "а".into(), role: "Шрек".into() }, Line::new(5.0, 6.0), Line::new(10.5, 11.5)];
         let v = move_moments(&m, &[(1.0, 4.0), (9.0, 12.0)]);
-        assert_eq!(v, vec![Line { start: 1.0, end: 2.0, text: "а".into() }, Line::new(4.5, 5.5)]);
+        assert_eq!(v, vec![Line { start: 1.0, end: 2.0, text: "а".into(), role: "Шрек".into() }, Line::new(4.5, 5.5)]);
+    }
+
+    #[test]
+    fn roles_and_improvisation() {
+        // the file keeps text, character and the improvisation mark; old files still read
+        let dir = std::env::temp_dir().join(format!("kj_roles_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sc = dir.join("a.mp4");
+        let v = vec![Line { start: 1.0, end: 2.0, text: "Привет".into(), role: "Шрек".into() }, Line { start: 3.0, end: 4.0, role: "Осёл".into(), ..Default::default() }, Line::new(5.0, 6.0)];
+        save_lines_as(&sc, &v, true);
+        assert!(is_improv(&sc));
+        assert_eq!(load_lines(&sc).unwrap(), v);
+        save_lines(&sc, &v[..1]); // keeps the mark
+        assert!(is_improv(&sc));
+        save_lines_as(&sc, &v, false);
+        assert!(!is_improv(&sc));
+        assert_eq!(parse_lines("1.0\t2.0\tтекст\n").unwrap()[0].role, "");
+        let _ = std::fs::remove_dir_all(&dir);
+        // equal parts for improvisation cover the clip without overlaps
+        let p = even_parts(20.0, 6.0);
+        assert_eq!(p.len(), 3);
+        assert!(p.windows(2).all(|w| w[0].end < w[1].start) && p[2].end <= 20.0);
+
+        // roles: the microphone goes to whoever plays the character; a character nobody plays stays original
+        let mut d = Dub::demo(vec!["Макс".into(), "Слава".into()], true);
+        assert_eq!(d.roles(), vec!["Папа", "Сын", "Мама"]);
+        d.cast = Some(vec![("Папа".into(), Some(0)), ("Сын".into(), Some(1)), ("Мама".into(), None)]);
+        assert_eq!((d.owner(0), d.owner(1), d.owner(2)), (Some(0), Some(1), None));
+        d.takes = vec![vec![None; d.lines.len()]; 2];
+        assert_eq!(d.next_open(0), 0);
+        d.takes[0][0] = Some(Take { at: 1.0, samples: vec![0.5; 16000], sr: 16000 });
+        assert_eq!(d.next_open(0), 1);
+        d.takes[1][1] = Some(Take { at: 4.9, samples: vec![0.5; 16000], sr: 16000 });
+        assert_eq!(d.next_open(2), 3, "Мама's line is skipped");
+        // «Мама» keeps her voice: her moment is not turned down in the background
+        let bg = d.background();
+        let at = |t: f32| bg[(t * 16000.0) as usize].abs().max(bg[(t * 16000.0) as usize + 7].abs());
+        let orig = |t: f32| d.orig[(t * 16000.0) as usize].abs().max(d.orig[(t * 16000.0) as usize + 7].abs());
+        assert!((at(10.5) - orig(10.5)).abs() < 1e-6 && at(6.0) < orig(6.0) * 0.5);
+        // the team's version has both players' takes
+        let m = d.version(0);
+        assert!(m[(1.5 * 16000.0) as usize].abs() > 0.3 && m[(5.5 * 16000.0) as usize].abs() > 0.3);
+        assert!(d.cast_line().contains("Мама — оригинал"));
     }
 
     #[test]
@@ -2288,6 +2594,7 @@ impl Dub {
         }
         let said = ["Кто опять съел все сосиски?", "Это не я, это ёжик! Он с утра какой-то подозрительный.", "Ёжик спит.", "Значит, он ест во сне. Я видел, честное слово!", "Ладно, жарим зефир."];
         for (l, t) in lines.iter_mut().zip(said) { l.text = t.into(); }
+        for (l, r) in lines.iter_mut().zip(["Папа", "Сын", "Мама", "Сын", "Папа"]) { l.role = r.into(); }
         d.side = vec![0.0; x.len()];
         d.fullenv = wave::envelope(&x, sr, 24 * 100);
         d.peak_max = x.iter().fold(1e-4f32, |m, v| m.max(v.abs()));
@@ -2295,6 +2602,11 @@ impl Dub {
         d.scene = Some(PathBuf::from("Сцена у костра.mp4"));
         d.lines = lines;
         d.players = players;
+        if std::env::var("KJ_DEMO").as_deref() == Ok("cast") {
+            d.cast = Some(vec![("Папа".into(), Some(0)), ("Сын".into(), Some(1)), ("Мама".into(), None)]);
+            d.phase = DPhase::Cast;
+            return d;
+        }
         if std::env::var("KJ_DEMO").as_deref() == Ok("cut") {
             d.phase = DPhase::Edit;
             d.view = (0.0, 24.0);

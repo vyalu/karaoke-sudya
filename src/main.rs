@@ -706,6 +706,7 @@ impl App {
             match which.as_str() {
                 "games" => app.show_games = true,
                 "sound" => app.show_settings = true,
+                "cast" => { app.dub = Some(dub::Dub::demo(players.clone(), false)); app.show_dub = true; }
                 "parodist" => { app.game = Some(game::Game::demo(players.clone())); app.show_game = true; app.boris.queue("Очко получает Макс! Качество 86 из 100. Это шедевр!".into()); }
                 "dub" => { app.dub = Some(dub::Dub::demo(players.clone(), false)); app.show_dub = true; app.boris.queue("Микрофон у Макса! Не подведи.".into()); }
                 "dubsetup" => app.open_dub(),
